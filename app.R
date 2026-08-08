@@ -1,7 +1,7 @@
 ################################################################################
 # JMMI RCA - TABLEAU DE BORD (habillage Shiny du pipeline de nettoyage)
 ################################################################################
-# Ce dossier est AUTONOME (self-contained) : 1_suivi_quotidien.R, 2_nettoyage_final.R, relabel_choices.R,
+# Ce dossier est AUTONOME (self-contained) : 1_suivi_quotidien.R, 2_nettoyage_final.R, 3_relabel_choices.R,
 # scripts/ et ressources/ sont des COPIES des projets rca_jmmi_cleaning et jmmi_relabelling (sources
 # d'origine, a cote), placees ici pour que ce dossier puisse etre deploye/zippe/partage seul, sans
 # dependre des dossiers voisins a l'execution.
@@ -48,11 +48,11 @@ ui <- shiny::bootstrapPage(
     id = "navbarPage",
     theme = shinythemes::shinytheme("flatly"),
     collapsible = TRUE,
-    title = div(HTML('<a style="text-decoration:none;cursor:default;color:#FFFFFF;" class="active" href="#">JMMI RCA - Nettoyage des donn\u00e9es</a>')),
+    title = div(HTML('<a style="text-decoration:none;cursor:default;color:#FFFFFF;" class="active" href="#">JMMI RCA Dashboard </a>')),
     windowTitle = "JMMI RCA - Tableau de bord",
     position = "fixed-top",
 
-    tabPanel("Tableau de bord",
+    tabPanel("Nettoyage donn\u00e9es",
       div(class = "content-wrapper",
         fluidRow(
           div(class = "dashboard-box",
@@ -103,7 +103,7 @@ ui <- shiny::bootstrapPage(
                 ),
                 conditionalPanel(
                   condition = "input.mode_select == 'etiquetage'",
-                  column(6, fileInput("file_clean_data", "Classeur nettoy\u00e9 (sortie de l'\u00e9tape \"Finale\", .xlsx)", accept = ".xlsx", width = "100%"))
+                  column(6, fileInput("file_clean_data", "Base des don\u00e9es nettoy\u00e9e (sortie de l'\u00e9tape \"Finale\", .xlsx)", accept = ".xlsx", width = "100%"))
                 ),
                 column(6, fileInput("file_kobo", "Outil Kobo (survey/choices, .xlsx)", accept = ".xlsx", width = "100%"))
               )
@@ -243,8 +243,8 @@ run_relabel_pipeline <- function(clean_data_path, kobo_path) {
 
   file.copy(file.path(PIPELINE_ROOT, "scripts", "fonctions_relabel.R"),
             file.path(tmp, "scripts", "fonctions_relabel.R"), overwrite = TRUE)
-  file.copy(file.path(PIPELINE_ROOT, "relabel_choices.R"),
-            file.path(tmp, "relabel_choices.R"), overwrite = TRUE)
+  file.copy(file.path(PIPELINE_ROOT, "3_relabel_choices.R"),
+            file.path(tmp, "3_relabel_choices.R"), overwrite = TRUE)
 
   file.copy(clean_data_path, file.path(tmp, "input", "clean_data.xlsx"), overwrite = TRUE)
   file.copy(kobo_path, file.path(tmp, "input", "kobo_tool.xlsx"), overwrite = TRUE)
@@ -261,7 +261,7 @@ run_relabel_pipeline <- function(clean_data_path, kobo_path) {
   on.exit(setwd(old_wd), add = TRUE)
 
   log_out <- tryCatch(
-    system2(RSCRIPT_PATH, args = shQuote("relabel_choices.R"), stdout = TRUE, stderr = TRUE),
+    system2(RSCRIPT_PATH, args = shQuote("3_relabel_choices.R"), stdout = TRUE, stderr = TRUE),
     error = function(e) paste("ERREUR AU LANCEMENT DE R :", conditionMessage(e))
   )
   status <- attr(log_out, "status")

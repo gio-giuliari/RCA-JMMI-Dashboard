@@ -36,11 +36,11 @@ kobo_choices <- read_excel(Sys.getenv("kobo_tool_file"), sheet = "choices", col_
 
 clean_data_file <- Sys.getenv("clean_data_file")
 
-cat("--> Chargement du classeur nettoye (toutes feuilles)...\n")
+cat("--> Chargement du donnees nettoyees (toutes feuilles)...\n")
 wb <- loadWorkbook(clean_data_file)
 sheets_to_relabel <- intersect(c("raw_data", "clean_data"), names(wb))
 if (length(sheets_to_relabel) == 0) {
-  stop("Aucune feuille 'raw_data' ou 'clean_data' trouvee dans le classeur nettoye - rien a re-etiqueter.")
+  stop("Aucune feuille 'raw_data' ou 'clean_data' trouvee dans la base de donnees nettoyee - rien a re-etiqueter.")
 }
 
 for (sheet in sheets_to_relabel) {
