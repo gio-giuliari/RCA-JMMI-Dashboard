@@ -4,7 +4,7 @@
 # ENTREE      : Sys.getenv("clean_data_file") - le classeur final produit par le nettoyage JMMI (lit
 #               ses feuilles "raw_data"/"clean_data", en-tete sur deux lignes) ; Sys.getenv("kobo_tool_file")
 #               - l'outil kobo correspondant (feuilles "survey"/"choices")
-# SORTIE      : Sys.getenv("output_dir")/<nom du fichier d'entree>_libelle.xlsx - une COPIE COMPLETE du
+# SORTIE      : Sys.getenv("output_dir")/<nom du fichier d'entree>_final.xlsx - une COPIE COMPLETE du
 #               classeur d'entree (memes feuilles, meme ordre, meme mise en forme) ou, dans "raw_data" et
 #               "clean_data" uniquement : (1) les CODES des reponses a choix (select_one/select_multiple)
 #               sont remplaces par leur LIBELLE, (2) la ligne d'etiquette des colonnes binaires
@@ -55,7 +55,7 @@ for (sheet in sheets_to_relabel) {
 
 output_dir <- Sys.getenv("output_dir")
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
-out_name <- paste0(tools::file_path_sans_ext(basename(clean_data_file)), "_libelle.xlsx")
+out_name <- paste0(tools::file_path_sans_ext(basename(clean_data_file)), "_final.xlsx")
 out_path <- file.path(output_dir, out_name)
 
 saveWorkbook(wb, out_path, overwrite = TRUE)

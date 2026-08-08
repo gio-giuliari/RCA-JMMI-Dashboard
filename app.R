@@ -231,10 +231,21 @@ run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL) {
   list(ok = ok, log = paste(log_out, collapse = "\n"), file = output_file)
 }
 
+## nom de fichier sur - conserve le nom original importe par l'utilisateur (pour que le fichier de
+## sortie du re-etiquetage suive la meme convention de nommage que le classeur d'entree, voir
+## 3_relabel_choices.R), mais retire tout chemin et tout caractere invalide dans un nom de fichier
+## Windows ; force l'extension .xlsx (seul format accepte par le fileInput).
+safe_input_filename <- function(name) {
+  base <- tools::file_path_sans_ext(basename(name))
+  base <- gsub('[\\\\/:*?"<>|]', "_", base)
+  if (!nzchar(base)) base <- "clean_data"
+  paste0(base, ".xlsx")
+}
+
 ## meme principe que run_pipeline() (dossier temporaire isole + processus Rscript.exe separe), mais
 ## pour l'outil de re-etiquetage des choix (independant du pipeline de nettoyage lui-meme : prend en
 ## entree le classeur nettoye deja produit, pas les donnees brutes).
-run_relabel_pipeline <- function(clean_data_path, kobo_path) {
+run_relabel_pipeline <- function(clean_data_path, clean_data_name, kobo_path) {
 
   tmp <- file.path(tempdir(), paste0("jmmi_relabel_", gsub("[^0-9]", "", format(Sys.time(), "%Y%m%d%H%M%OS3"))))
   dir.create(file.path(tmp, "input"), recursive = TRUE)
@@ -246,12 +257,16 @@ run_relabel_pipeline <- function(clean_data_path, kobo_path) {
   file.copy(file.path(PIPELINE_ROOT, "3_relabel_choices.R"),
             file.path(tmp, "3_relabel_choices.R"), overwrite = TRUE)
 
-  file.copy(clean_data_path, file.path(tmp, "input", "clean_data.xlsx"), overwrite = TRUE)
+  # nom d'entree preserve (voir safe_input_filename) - 3_relabel_choices.R nomme sa sortie
+  # "<nom du fichier d'entree>_final.xlsx", donc conserver le nom original ici est ce qui garantit
+  # que le fichier telecharge suit la convention de nommage standard au lieu d'un nom fixe generique.
+  clean_data_filename <- safe_input_filename(clean_data_name)
+  file.copy(clean_data_path, file.path(tmp, "input", clean_data_filename), overwrite = TRUE)
   file.copy(kobo_path, file.path(tmp, "input", "kobo_tool.xlsx"), overwrite = TRUE)
 
   env_lines <- c(
     paste0('kobo_tool_file = "', file.path(tmp, "input", "kobo_tool.xlsx"), '"'),
-    paste0('clean_data_file = "', file.path(tmp, "input", "clean_data.xlsx"), '"'),
+    paste0('clean_data_file = "', file.path(tmp, "input", clean_data_filename), '"'),
     paste0('output_dir = "', file.path(tmp, "output"), '/"')
   )
   writeLines(env_lines, file.path(tmp, ".Renviron"))
@@ -268,7 +283,7 @@ run_relabel_pipeline <- function(clean_data_path, kobo_path) {
   ok <- is.null(status) || identical(status, 0L)
 
   out_dir <- file.path(tmp, "output")
-  files <- if (dir.exists(out_dir)) list.files(out_dir, pattern = "_libelle\\.xlsx$", full.names = TRUE) else character()
+  files <- if (dir.exists(out_dir)) list.files(out_dir, pattern = "_final\\.xlsx$", full.names = TRUE) else character()
   output_file <- if (length(files) > 0) files[1] else NULL
 
   if (ok && is.null(output_file)) {
@@ -319,6 +334,7 @@ server <- function(input, output, session) {
       if (identical(kind, "etiquetage")) {
         run_relabel_pipeline(
           clean_data_path = input$file_clean_data$datapath,
+          clean_data_name = input$file_clean_data$name,
           kobo_path = input$file_kobo$datapath
         )
       } else {
