@@ -589,8 +589,7 @@ build_final_workbook(
   admin2_covered = admin2_covered,
   partners_covered = partners_covered,
   assessment_month_label = period$assessment_month_label,
-  assessment_year = assessment_year,
-  has_logical_checks = has_logical_checks
+  assessment_year = assessment_year
 )
 
 cat("\n--> Classeur combine final ecrit dans :", output_path, "\n")

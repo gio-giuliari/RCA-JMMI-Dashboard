@@ -511,8 +511,10 @@ add_other_responses_sheet <- function(wb, df, sheet_name = "reponses_autres") {
 
   addStyle(wb, sheet_name, style = createStyle(wrapText = TRUE), rows = 1:21, cols = 1)
 
-  # ajouter la feuille des valeurs de liste deroulante et la validation des donnees
-  addWorksheet(wb, dropdown_sheet)
+  # ajouter la feuille des valeurs de liste deroulante et la validation des donnees - cachee (visible =
+  # FALSE) car elle ne sert que de source aux listes deroulantes ci-dessous, l'equipe de suivi n'a jamais
+  # besoin de l'ouvrir directement
+  addWorksheet(wb, dropdown_sheet, visible = FALSE)
   for (r in seq_len(nrow(other_db))) {
 
     if (other_db$q_type[r] != "text") {
@@ -586,6 +588,30 @@ add_other_responses_sheet <- function(wb, df, sheet_name = "reponses_autres") {
 
   modifyBaseFont(wb, fontSize = 10, fontColour = "black", fontName = "Calibri")
 
+  # protection de la feuille (meme logique que write_review_sheet()/A_verifier) : la ligne d'en-tete et
+  # les colonnes techniques (uuid, type_question, liste_choix, nom_question, libelle_complet, reponse,
+  # choix_selectionnes, ...) restent verrouillees (locked = TRUE par defaut, aucune des cellules
+  # ci-dessus n'a ete deverrouillee). Seules les colonnes que l'equipe de suivi doit remplir sont
+  # deverrouillees ci-dessous - stack = TRUE pour AJOUTER locked = FALSE aux styles deja appliques
+  # (couleurs/bordures) plutot que de les remplacer.
+  editable_labels <- c(
+    "VRAI autre (copier la reponse ou fournir une meilleure traduction)",
+    "EXISTANT autre 1 (choisir la reponse la plus appropriee)",
+    "EXISTANT autre 2 (choisir la reponse la plus appropriee)",
+    "EXISTANT autre 3 (choisir la reponse la plus appropriee)",
+    "INVALIDE autre (selectionner oui ou laisser vide)",
+    "Message de SUIVI (qu'est-ce qui n'est pas clair dans cette reponse ?)",
+    "Explication"
+  )
+  editable_cols <- match(editable_labels, colnames(df_display))
+  editable_cols <- editable_cols[!is.na(editable_cols)]
+  addStyle(wb, sheet_name, style = createStyle(locked = FALSE), rows = 2:(nrow(df) + 1),
+          cols = editable_cols, gridExpand = TRUE, stack = TRUE)
+
+  # aucun mot de passe defini - protection uniquement contre les modifications accidentelles (voir
+  # write_review_sheet()), pas une mesure de securite.
+  protectWorksheet(wb, sheet_name, protect = TRUE)
+
   invisible(wb)
 }
 
@@ -610,7 +636,7 @@ REVIEW_HEADERS_FR <- c(
   reponse_actuelle = "Reponse actuelle",
   probleme = "Probleme detecte",
   action = "Que faire ? (obligatoire)",
-  nouvelle_reponse = "Nouvelle reponse (si Corriger la reponse)",
+  nouvelle_reponse = "Nouvelle reponse (si 'Corriger la reponse')",
   # ce commentaire est aussi repris comme raison de suppression dans le classeur final (deletion_log)
   # quand "Que faire ?" = "Supprimer toute l'enquete" - voir deletion_log_final dans 2_nettoyage_final.R
   commentaire = "Commentaire (raison de suppression si l'enquete entiere est supprimee)"
@@ -1058,7 +1084,7 @@ write_labeled_data_sheet <- function(wb, sheet_name, df){
 # JMMI). Seuls les libelles de section (ex. "Colonnes obligatoires dans clean_data :") et les lignes
 # vides du modele restent sans valeur. Les numeros de ligne correspondent a la feuille
 # "CHECKLIST_Data_Cleaning" de ressources/Checklist-Template_..._FRENCH.xlsx.
-fill_checklist_data_cleaning <- function(wb, has_logical_checks){
+fill_checklist_data_cleaning <- function(wb){
   sheet <- "CHECKLIST_Data_Cleaning"
   set_check <- function(row, value) writeData(wb, sheet, x = value, startRow = row, startCol = 1, colNames = FALSE)
 
@@ -1083,7 +1109,7 @@ fill_checklist_data_cleaning <- function(wb, has_logical_checks){
   set_check(36, "y")   # Enquetes quasi-dupliquees (check_soft_duplicates)
   set_check(37, "y")   # Enquetes au chemin le plus court
   set_check(38, "y")   # Valeurs aberrantes (check_outliers)
-  if (has_logical_checks) set_check(39, "y")  # Verifications logiques (seulement une fois check_list_august.xlsx rempli de vraies verifications)
+  set_check(39, "y")   # Verifications logiques
   set_check(40, "y")   # Variables "calculate" Kobo recalculees (prix EUR)
   set_check(41, "y")   # Performance des enqueteurs
   set_check(42, "y")   # Verifications specifiques au secteur
@@ -1204,7 +1230,7 @@ write_read_me_sheet <- function(wb, assessment_month_label, assessment_year, col
 build_final_workbook <- function(raw_data_export, clean_data_export, cleaning_log_final, deletion_log_final,
                                  variable_tracker_final, output_path, final_survey_count,
                                  collection_start, collection_end, admin1_covered, admin2_covered, partners_covered,
-                                 assessment_month_label, assessment_year, has_logical_checks){
+                                 assessment_month_label, assessment_year){
 
   wb <- loadWorkbook(Sys.getenv("checklist_template"))
   for (sh in c("READ_ME","survey","choices","variable_tracker","raw_data","clean_data",
@@ -1216,7 +1242,7 @@ build_final_workbook <- function(raw_data_export, clean_data_export, cleaning_lo
   # deletion_log est toujours incluse, meme vide (0 suppression) - plus simple et plus previsible pour
   # le reviseur qu'une feuille qui apparait ou disparait d'un cycle a l'autre.
   has_deletions <- nrow(deletion_log_final) > 0
-  fill_checklist_data_cleaning(wb, has_logical_checks = has_logical_checks)
+  fill_checklist_data_cleaning(wb)
 
   sheet_descriptions <- list(
     "CHECKLIST_Data_Cleaning" = "Auto-evaluation des normes minimales de nettoyage - remplie automatiquement pour les verifications que le script peut certifier, le reste a completer par le reviseur.",
@@ -1247,6 +1273,15 @@ build_final_workbook <- function(raw_data_export, clean_data_export, cleaning_lo
 
   write_simple_sheet(wb, "cleaning_log", cleaning_log_final)
   write_simple_sheet(wb, "deletion_log", deletion_log_final)
+  # reason_deletion contient un texte libre (repris du commentaire de l'equipe de suivi - voir
+  # deletion_log_final dans 2_nettoyage_final.R) souvent plus long qu'une largeur "auto" ne l'anticipe -
+  # elargie explicitement et avec retour a la ligne pour rester lisible
+  reason_col <- which(colnames(deletion_log_final) == "reason_deletion")
+  if (length(reason_col) == 1) {
+    setColWidths(wb, "deletion_log", cols = reason_col, widths = 60)
+    addStyle(wb, "deletion_log", style = createStyle(wrapText = TRUE, valign = "top"),
+            rows = 2:(nrow(deletion_log_final) + 1), cols = reason_col, gridExpand = TRUE, stack = TRUE)
+  }
 
   desired_order <- intersect(c("CHECKLIST_Data_Cleaning","READ_ME","survey","choices","variable_tracker",
                                "raw_data","clean_data","cleaning_log","deletion_log"), names(wb))

@@ -77,7 +77,11 @@ ui <- shiny::bootstrapPage(
               div(class = "step-title", "Etape 1 - Que voulez-vous faire ?"),
               div(class = "mode-toggle",
                 radioButtons("mode_select", label = NULL, inline = TRUE,
-                  choiceNames = list("Suivi quotidien (collecte en cours)", "Nettoyage des donn\u00e9es (fin de collecte)", "\u00c9tiquetage des choix (post-nettoyage)"),
+                  choiceNames = list(
+                    HTML("Suivi quotidien<span class=\"pill-sub\">(collecte en cours)</span>"),
+                    HTML("Nettoyage des donn\u00e9es<span class=\"pill-sub\">(fin de collecte)</span>"),
+                    HTML("\u00c9tiquetage des choix<span class=\"pill-sub\">(post-nettoyage/validation)</span>")
+                  ),
                   choiceValues = list("suivi", "nettoyage", "etiquetage")
                 )
               ),
