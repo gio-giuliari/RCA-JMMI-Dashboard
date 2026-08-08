@@ -294,6 +294,101 @@ run_relabel_pipeline <- function(clean_data_path, clean_data_name, kobo_path) {
   list(ok = ok, log = paste(log_out, collapse = "\n"), file = output_file)
 }
 
+## traduit le journal d'exécution technique (texte brut du sous-processus Rscript.exe) en un diagnostic
+## court, spécifique et actionnable en français, affiché AU-DESSUS du journal brut en cas d'échec (voir
+## result_summary dans server()). Fonctionne par reconnaissance de motifs connus (messages d'erreur
+## définis dans ce dossier, ou erreurs techniques R/Excel courantes) ; si aucun motif ne correspond,
+## renvoie un message générique adapté à l'étape en cours plutôt que de laisser l'utilisateur seul face
+## au texte technique brut.
+ERROR_PATTERNS <- list(
+  list(
+    pattern = "Doublons detectes \\(identifiant d'enquete identique\\)",
+    titre = "Doublons dans les données brutes",
+    message = "Le fichier de données brutes contient plusieurs lignes avec le même identifiant d'enquête (uuid). C'est un problème technique d'export Kobo, pas quelque chose que l'équipe de suivi peut corriger dans un classeur.",
+    action = "Ré-exportez les données depuis Kobo (ou contactez le support technique) pour obtenir un export sans doublons, puis relancez le traitement."
+  ),
+  list(
+    pattern = "Certaines combinaisons enquete/variable sont signalees plus d'une fois",
+    titre = "Le classeur rempli contient des lignes en double",
+    message = "Dans le classeur \"suivi à vérifier\" renvoyé par l'équipe de suivi, une même combinaison enquête + variable apparaît plusieurs fois dans la feuille A_verifier.",
+    action = "Ouvrez le classeur rempli, repérez les lignes dupliquées (même identifiant d'enquête et même variable dans les colonnes grisées) et supprimez ou harmonisez les doublons, puis réimportez le classeur corrigé."
+  ),
+  list(
+    pattern = "Doublons detectes dans le journal de nettoyage des reponses autre",
+    titre = "Doublons dans le recodage des réponses \"autre\"",
+    message = "La feuille reponses_autres du classeur rempli contient plusieurs recodages différents pour la même réponse \"autre\" de la même enquête.",
+    action = "Dans la feuille reponses_autres, vérifiez qu'une seule case (VRAI / EXISTANT / INVALIDE) a été remplie par ligne, puis réimportez le classeur corrigé."
+  ),
+  list(
+    pattern = "Aucune feuille 'raw_data' ou 'clean_data' trouvee",
+    kinds = "etiquetage",
+    titre = "Mauvais fichier importé pour l'étiquetage",
+    message = "Le classeur importé ne contient ni feuille raw_data ni clean_data. Cette étape attend en entrée le classeur FINAL produit par le nettoyage (\"Nettoyage des données\" > \"Finale\"), pas les données brutes ni un autre type de fichier.",
+    action = "Importez le fichier REACH_CAR_Dataset_JMMI_<Mois>-<Année>.xlsx téléchargé à la fin de l'étape \"Finale\" du nettoyage, puis relancez l'étiquetage."
+  ),
+  list(
+    pattern = "ERREUR AU LANCEMENT DE R",
+    titre = "Impossible de démarrer le moteur R",
+    message = "L'application n'a pas réussi à lancer le processus R qui exécute le traitement (Rscript.exe).",
+    action = "Ce n'est pas un problème avec vos fichiers - contactez la personne en charge de l'installation du tableau de bord (chemin de R probablement introuvable ou modifié)."
+  ),
+  list(
+    pattern = "not found in workbook|Sheet .* not found|n'existe pas dans (ce|le) classeur",
+    titre = "Onglet manquant dans le fichier importé",
+    message = "Le fichier importé ne contient pas l'onglet (la feuille Excel) attendu - par exemple \"survey\" ou \"choices\" pour l'outil Kobo. C'est probablement le mauvais fichier, ou une version incomplète de l'outil Kobo.",
+    action = "Vérifiez que chaque fichier est importé dans la bonne case (outil Kobo dans \"Outil Kobo\", données dans \"Jeu de données\"), puis réessayez."
+  ),
+  list(
+    pattern = "not a zip file|invalid zip|corrupt workbook|Corrupt|zip end of central directory",
+    titre = "Fichier illisible ou corrompu",
+    message = "Le fichier importé n'a pas pu être ouvert comme un classeur Excel valide (.xlsx). Il est peut-être corrompu, encore au format .xls, ou le téléchargement a été interrompu.",
+    action = "Ouvrez le fichier vous-même dans Excel pour vérifier qu'il s'ouvre correctement, ré-enregistrez-le au format .xlsx si besoin, puis réimportez-le."
+  ),
+  list(
+    pattern = "object '[^']+' not found|could not find function",
+    titre = "Colonne ou variable manquante",
+    message = "Le traitement s'attend à trouver une colonne ou une variable qui est absente du fichier importé - le plus souvent parce que l'outil Kobo importé ne correspond pas exactement aux données (version différente de celle utilisée pour la collecte).",
+    action = "Vérifiez que l'outil Kobo importé est bien la version utilisée pour CETTE collecte, et que le fichier de données provient bien du même outil, puis réessayez."
+  ),
+  list(
+    pattern = "Le script s'est termin.{1,2} sans erreur mais aucun fichier de sortie",
+    kinds = c("suivi", "pour_suivi"),
+    titre = "Aucun résultat produit",
+    message = "Le traitement s'est déroulé sans erreur technique, mais n'a produit aucun fichier de sortie - le plus souvent parce que les données importées sont vides, ou que la colonne \"date\" n'est pas correctement renseignée dans le fichier de données brutes.",
+    action = "Vérifiez que le fichier de données brutes contient bien des enquêtes avec une date renseignée, puis réessayez."
+  ),
+  list(
+    pattern = "Le script s'est termin.{1,2} sans erreur mais aucun fichier de sortie",
+    kinds = "finale",
+    titre = "Aucun classeur final produit",
+    message = "Le traitement s'est déroulé sans erreur technique, mais n'a pas produit de classeur final - le plus souvent parce que le classeur \"suivi à vérifier\" importé ne correspond pas à celui généré à la première exécution (fichier renommé, ou provenant d'un autre jeu de données).",
+    action = "Réimportez le classeur \"suivi à vérifier\" tel qu'il a été téléchargé et rempli, sans le renommer, en vous assurant qu'il correspond bien au même fichier de données brutes que la première exécution."
+  )
+)
+
+diagnose_error <- function(kind, log_text) {
+  for (p in ERROR_PATTERNS) {
+    if (!is.null(p$kinds) && !identical(kind, "") && !(kind %in% p$kinds)) next
+    if (grepl(p$pattern, log_text, ignore.case = TRUE)) {
+      return(list(titre = p$titre, message = p$message, action = p$action))
+    }
+  }
+
+  generic_message <- switch(kind,
+    suivi = "Causes fréquentes : le fichier de données brutes ne correspond pas à l'outil Kobo importé, ou la colonne \"date\" est manquante/mal renseignée.",
+    pour_suivi = "Causes fréquentes : le fichier de données brutes ne correspond pas à l'outil Kobo importé, ou un fichier n'est pas au format .xlsx attendu.",
+    finale = "Causes fréquentes : le classeur \"suivi à vérifier\" ne correspond pas au même fichier de données brutes que la première exécution, ou une ligne du classeur rempli est incohérente (voir le journal ci-dessous pour l'identifiant d'enquête concerné).",
+    etiquetage = "Causes fréquentes : le classeur nettoyé importé ne provient pas de l'étape \"Finale\" du nettoyage, ou l'outil Kobo importé ne correspond pas à ces données.",
+    "Causes fréquentes : fichiers importés au mauvais endroit, fichier non conforme au format .xlsx, ou incohérence entre les données et l'outil Kobo."
+  )
+
+  list(
+    titre = "Erreur inattendue",
+    message = paste("Une erreur est survenue pendant le traitement.", generic_message),
+    action = "Vérifiez vos fichiers importés puis réessayez. Si le problème persiste, transmettez le journal d'exécution ci-dessous à la personne en charge du tableau de bord."
+  )
+}
+
 #### SERVER ####
 server <- function(input, output, session) {
 
@@ -374,9 +469,12 @@ server <- function(input, output, session) {
         div(class = "info-row", paste0("Fichier pr\u00eat : ", basename(result$file)))
       )
     } else {
+      diag <- diagnose_error(result$kind, result$log)
       div(class = "red-box",
-        div(class = "red-title", "Erreur"),
-        div(class = "red-row", "Le traitement a \u00e9chou\u00e9 - consultez le journal d'ex\u00e9cution ci-dessous.")
+        div(class = "red-title", diag$titre),
+        div(class = "red-row", diag$message),
+        div(class = "red-line"),
+        div(class = "red-row", tags$b("Que faire : "), diag$action)
       )
     }
   })

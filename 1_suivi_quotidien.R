@@ -9,7 +9,10 @@
 #               colonne) et des bannieres de section entre communes/sous-prefectures/prefectures/
 #               national ; Prix_Median a une echelle de couleur rouge (prix eleve) / vert (prix bas)
 #               calculee separement pour chaque article. Suivent Resume, Detail et
-#               Resume_Partenaire_Zone (style standard, inchange).
+#               Resume_Partenaire_Zone (style standard, inchange), puis raw_data (jeu de donnees brutes
+#               importe, anonymise de la meme maniere que raw_data dans le classeur final - voir
+#               2_nettoyage_final.R -, en-tete sur deux lignes), pour retrouver le detail d'une ligne
+#               signalee sans devoir rouvrir l'export kobo brut.
 # DESCRIPTION : Ne fait AUCUNE verification/nettoyage - uniquement un suivi de la couverture de la
 #               collecte (nombre d'enquetes/de prix par commune/partenaire) et des prix medians par
 #               article, pour un pilotage au jour le jour.
@@ -74,6 +77,17 @@ median_prices_df <- get_median_prices(raw_data_all)
 # resume partenaire vs zone
 partner_region_summary <- create_partner_region_summary(raw_data_all)
 
+# donnees brutes a inclure dans le classeur, anonymisees de la meme maniere que raw_data dans le
+# classeur final (voir 2_nettoyage_final.R) - permet de retrouver le detail d'une ligne signalee dans
+# Nombre_Prix/Prix_Median sans devoir rouvrir l'export kobo brut.
+remove_cols_raw <- c(
+  intersect(colnames(raw_data_all), filter(kobo_survey, type %in% c("geopoint"))$name),
+  "audit", "audit_URL", "deviceid", "enum_id", "shop_name", "organisation_name_label"
+)
+remove_cols_raw <- intersect(remove_cols_raw, colnames(raw_data_all))
+raw_data_export <- select(raw_data_all, -all_of(remove_cols_raw))
+if ("_index" %in% colnames(raw_data_export)) raw_data_export <- rename(raw_data_export, id = `_index`)
+
 ################################################################################
 # ECRITURE DU CLASSEUR
 ################################################################################
@@ -94,9 +108,10 @@ mp_rows <- write_priority_sheet(wb, "Prix_Median", median_prices_df)
 add_styled_sheet(wb, "Resume", summary_df)
 add_styled_sheet(wb, "Detail", detail_df)
 add_styled_sheet(wb, "Resume_Partenaire_Zone", partner_region_summary)
+write_labeled_data_sheet(wb, "raw_data", apply_var_labels(raw_data_export))
 
 worksheetOrder(wb) <- match(
-  c("Nombre_Prix", "Prix_Median", "Resume", "Detail", "Resume_Partenaire_Zone"),
+  c("Nombre_Prix", "Prix_Median", "Resume", "Detail", "Resume_Partenaire_Zone", "raw_data"),
   names(wb)
 )
 activeSheet(wb) <- "Nombre_Prix"

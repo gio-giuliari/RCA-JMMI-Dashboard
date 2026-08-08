@@ -602,15 +602,18 @@ REVIEW_HEADERS_FR <- c(
   uuid = "Identifiant enquete (ne pas modifier)",
   commune = "Commune",
   partenaire = "Partenaire",
+  date = "Date",
   enqueteur = "Enqueteur",
   boutique = "Boutique / vendeur",
   variable = "Variable (ne pas modifier)",
   question_label = "Question",
   reponse_actuelle = "Reponse actuelle",
   probleme = "Probleme detecte",
-  action = "Que faire ?",
+  action = "Que faire ? (obligatoire)",
   nouvelle_reponse = "Nouvelle reponse (si Corriger la reponse)",
-  commentaire = "Commentaire"
+  # ce commentaire est aussi repris comme raison de suppression dans le classeur final (deletion_log)
+  # quand "Que faire ?" = "Supprimer toute l'enquete" - voir deletion_log_final dans 2_nettoyage_final.R
+  commentaire = "Commentaire (raison de suppression si l'enquete entiere est supprimee)"
 )
 
 # Options de la liste deroulante "Que faire ?", en langage simple <- valeur technique attendue par
@@ -661,12 +664,16 @@ write_review_sheet <- function(wb, df, sheet_name = "A_verifier") {
   freezePane(wb, sheet_name, firstActiveRow = 2, firstActiveCol = 2)
   addFilter(wb, sheet_name, rows = 1, cols = 1:ncol(df_display))
 
-  # texte avec retour a la ligne pour toutes les colonnes de contenu
-  addStyle(wb, sheet_name, style = createStyle(wrapText = TRUE, valign = "top"),
+  # texte avec retour a la ligne pour toutes les colonnes de contenu - deverrouillees (locked = FALSE)
+  # puisque ce sont les cellules que l'equipe de suivi doit remplir (voir protectWorksheet() ci-dessous)
+  addStyle(wb, sheet_name, style = createStyle(wrapText = TRUE, valign = "top", locked = FALSE),
            rows = 2:n, cols = 1:ncol(df_display), gridExpand = TRUE)
 
-  # colonnes techniques (a ne pas modifier) : fond gris pour bien les distinguer des colonnes a remplir
-  addStyle(wb, sheet_name, style = createStyle(fgFill = GREY_HEADER, fontColour = "#595959", wrapText = TRUE, valign = "top"),
+  # colonnes techniques (a ne pas modifier) : fond gris pour bien les distinguer des colonnes a remplir,
+  # et verrouillees (locked = TRUE, explicite car addStyle() remplace entierement le style precedent sur
+  # ces memes cellules - sans cela elles resteraient deverrouillees par le style ci-dessus)
+  addStyle(wb, sheet_name, style = createStyle(fgFill = GREY_HEADER, fontColour = "#595959", wrapText = TRUE,
+                                               valign = "top", locked = TRUE),
            rows = 2:n, cols = c(uuid_col, variable_col), gridExpand = TRUE)
 
   # liste deroulante pour la colonne "Que faire ?" - liste en ligne (pas besoin d'une feuille annexe,
@@ -675,8 +682,15 @@ write_review_sheet <- function(wb, df, sheet_name = "A_verifier") {
   dataValidation(wb, sheet_name, col = action_col, rows = 2:n, type = "list", value = action_choices)
 
   setColWidths(wb, sheet_name, cols = 1:ncol(df_display),
-              widths = c(20, 14, 16, 14, 18, 26, 30, 20, 32, 24, 26, 30))
+              widths = c(20, 14, 16, 14, 14, 18, 26, 30, 20, 32, 24, 26, 40))
   setRowHeights(wb, sheet_name, rows = 1, heights = 32)
+
+  # protection de la feuille : empeche de modifier l'en-tete (ligne 1, verrouillee par defaut) et les
+  # colonnes techniques "ne pas modifier" (uuid/variable, verrouillees ci-dessus), tout en laissant les
+  # cellules a remplir editables (deverrouillees ci-dessus) et le tri/filtre disponibles. Aucun mot de
+  # passe defini : protection uniquement contre les modifications accidentelles (un clic sur "Oter la
+  # protection" dans Excel suffit a la retirer), pas une mesure de securite.
+  protectWorksheet(wb, sheet_name, protect = TRUE)
 
   invisible(wb)
 }

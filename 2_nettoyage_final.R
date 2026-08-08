@@ -184,6 +184,7 @@ review_df <- all_issues %>%
     uuid = uuid,
     commune = admin3_label,
     partenaire = organisation_name_label,
+    date = date,
     enqueteur = enum_id,
     boutique = shop_name,
     variable = question,
@@ -194,7 +195,7 @@ review_df <- all_issues %>%
     nouvelle_reponse = NA_character_,
     commentaire = NA_character_
   ) %>%
-  arrange(commune, uuid)
+  arrange(partenaire, date)
 
 if (interactive()) View(review_df)
 
@@ -514,10 +515,15 @@ if ("_index" %in% colnames(raw_data_all_validation)) raw_data_all_validation <- 
 
 enum_lookup <- raw_data_all %>% select(uuid, enum_id, deviceid) %>% distinct()
 
+# reason_deletion vient de la colonne "Commentaire" de la feuille A_verifier (voir REVIEW_HEADERS_FR/
+# read_review_sheet() dans fonctions_nettoyage.R, qui la lit deja sous le nom interne "comment") -
+# c'est la ou l'equipe de suivi explique pourquoi elle a choisi "Supprimer toute l'enquete". Si une
+# enquete est signalee plusieurs fois, distinct(uuid, .keep_all = TRUE) garde le commentaire de la
+# premiere ligne rencontree.
 deletion_log_final <- deletion_log %>%
   distinct(uuid, .keep_all = TRUE) %>%
   left_join(enum_lookup, by = "uuid") %>%
-  mutate(reason_deletion = NA_character_) %>%
+  rename(reason_deletion = comment) %>%
   select(uuid, reason_deletion, enum_id)
 
 cleaning_log_final <- combined_cleaning_log %>%
