@@ -145,7 +145,15 @@ soft_dup <- raw_data_all %>%
   check_soft_duplicates(kobo_survey = kobo_survey, uuid_column = "uuid", idnk_value = "ne_sait_pas",
                         sm_separator = "/", log_name = "soft_duplicate_log", threshold = 5,
                         return_all_results = FALSE)
-df_soft_dup <- soft_dup$soft_duplicate_log %>%
+# check_soft_duplicates() ne renvoie la colonne "id_most_similar_survey" QUE s'il y a au moins un
+# quasi-doublon trouve - avec 0 quasi-doublon (cas reel, pas juste theorique, sur un petit jeu de
+# donnees propre), soft_duplicate_log n'a que uuid/issue, et la reference a cette colonne plus bas
+# ferait planter le mutate(). L'ajouter vide dans ce cas la rend inoffensive (0 lignes de toute facon).
+soft_dup_log <- soft_dup$soft_duplicate_log
+if (!"id_most_similar_survey" %in% colnames(soft_dup_log)) {
+  soft_dup_log$id_most_similar_survey <- character(0)
+}
+df_soft_dup <- soft_dup_log %>%
   mutate(question = NA_character_,
         old_value = paste0("Tres semblable a l'enquete ", id_most_similar_survey),
         issue = translate_issue_fr(issue),
@@ -304,15 +312,27 @@ if ("change_response" %in% filled_field_level$change_type) {
   cat("--> Aucune entree 'Corriger la reponse' dans le classeur rempli pour le moment - review_cleaning_log() ignore.\n")
 }
 
-clean_data <- create_clean_data(raw_dataset = raw_data_all, raw_data_uuid_column = "uuid",
-                                cleaning_log = filled_field_level, cleaning_log_uuid_column = "uuid",
-                                cleaning_log_question_column = "question",
-                                cleaning_log_new_value_column = "new_value",
-                                cleaning_log_change_type_column = "change_type",
-                                change_response_value = "change_response",
-                                NA_response_value = "blank_response",
-                                no_change_value = "no_action",
-                                remove_survey_value = "remove_survey")
+# cleaningtools::create_clean_data() ne gere pas un cleaning_log a 0 ligne (leve une erreur "You have
+# NAs in change_type option(s)" au lieu de ne rien faire) - situation reelle (pas seulement theorique)
+# quand tous les signalements sont soit "Ne rien changer", soit des signalements au niveau de
+# l'enquete entiere (quasi-doublon, % de valeurs manquantes - question = NA, donc exclus de
+# filled_field_level) marques "Supprimer toute l'enquete". Dans ce cas il n'y a rien a corriger au
+# niveau du champ : repartir simplement des donnees brutes (la suppression elle-meme est appliquee
+# plus bas, explicitement, via deletion_log - voir REVUE DU NETTOYAGE).
+if (nrow(filled_field_level) > 0) {
+  clean_data <- create_clean_data(raw_dataset = raw_data_all, raw_data_uuid_column = "uuid",
+                                  cleaning_log = filled_field_level, cleaning_log_uuid_column = "uuid",
+                                  cleaning_log_question_column = "question",
+                                  cleaning_log_new_value_column = "new_value",
+                                  cleaning_log_change_type_column = "change_type",
+                                  change_response_value = "change_response",
+                                  NA_response_value = "blank_response",
+                                  no_change_value = "no_action",
+                                  remove_survey_value = "remove_survey")
+} else {
+  cat("--> Aucune correction au niveau du champ dans le classeur rempli - create_clean_data() ignore.\n")
+  clean_data <- raw_data_all
+}
 
 ################################################################################
 # APPLIQUER LES MODIFICATIONS DES REPONSES "AUTRE"
@@ -419,6 +439,15 @@ if (length(or.files) > 0) {
 
 deletion_log <- filled %>% filter(change_type == "remove_survey")
 
+# create_clean_data() (ci-dessus) ne supprime une enquete de clean_data que si sa ligne de
+# suppression lui a ete transmise via filled_field_level - or les signalements au niveau de
+# l'enquete entiere (question = NA : quasi-doublon, % de valeurs manquantes) en sont TOUJOURS exclus,
+# meme quand ils sont marques "Supprimer toute l'enquete". Sans ce filtre explicite, une telle
+# enquete resterait presente dans clean_data alors meme que deletion_log (et donc le classeur final)
+# affirme qu'elle a ete supprimee. Filtre applique explicitement ici, quelle que soit l'origine du
+# signalement, plutot que de dependre du mecanisme interne (partiel) de create_clean_data().
+clean_data <- clean_data %>% filter(!uuid %in% deletion_log$uuid)
+
 filled_no_deletion <- filled %>%
   filter(change_type != "remove_survey") %>%
   filter(!uuid %in% deletion_log$uuid) %>%
@@ -478,16 +507,24 @@ clean_data_updated <- clean_data_updated %>% relocate(uuid)
 # RETRAIT DES INFORMATIONS SENSIBLES
 ################################################################################
 
+# "_id" (colonne systeme kobo optionnelle, absente des exports sans historique de soumissions
+# modifiees) a deja ete renommee "id" dans read_raw_data() si elle est presente (voir fonctions_
+# nettoyage.R). "_index" est conservee et renommee "id" a son tour SEULEMENT si ce n'est pas deja le
+# cas - sinon un vrai export Kobo qui a A LA FOIS "_id" ET "_index" (constate sur un export telecharge
+# directement depuis Kobo) ferait planter le rename() (deux colonnes "id"). Si "id" existe deja,
+# "_index" est simplement supprimee comme toute autre colonne systeme prefixee par "_".
+rename_index_to_id <- "_index" %in% colnames(clean_data_updated) && !"id" %in% colnames(clean_data_updated)
 remove_cols <- c(
   intersect(colnames(clean_data_updated), filter(kobo_survey, type %in% c("note", "geopoint", "decimal"))$name),
   "audit", "audit_URL", "deviceid", "enum_id", "shop_name", "consent", "organisation_name_label",
   # admin1_label/admin2_label/admin3_label sont conservees (nouvelles variables, consignees dans
   # variable_tracker ci-dessous) - c'est le mapping PCode -> nom depuis la feuille choices du kobo,
   # pas une colonne technique.
-  # "_index" est conservee (renommee "_id" ci-dessous) suivant la recommandation de la checklist de
-  # garder un identifiant unique independant de Kobo en plus de uuid - toute autre colonne systeme
-  # prefixee par "_" est supprimee.
-  setdiff(colnames(clean_data_updated)[str_starts(colnames(clean_data_updated), "_")], "_index"),
+  if (rename_index_to_id) {
+    setdiff(colnames(clean_data_updated)[str_starts(colnames(clean_data_updated), "_")], "_index")
+  } else {
+    colnames(clean_data_updated)[str_starts(colnames(clean_data_updated), "_")]
+  },
   colnames(clean_data_updated)[str_ends(colnames(clean_data_updated), "_other_unit_item")]
 )
 # NOTE : les colonnes "_std_unit_item" (ex. maize_std_unit_item) sont conservees - elles indiquent
@@ -496,7 +533,7 @@ remove_cols <- c(
 remove_cols <- intersect(remove_cols, colnames(clean_data_updated))
 
 clean_data_final <- select(clean_data_updated, -all_of(remove_cols))
-if ("_index" %in% colnames(clean_data_final)) clean_data_final <- rename(clean_data_final, id = `_index`)
+if (rename_index_to_id) clean_data_final <- rename(clean_data_final, id = `_index`)
 
 # donnees brutes pour validation - anonymisees de la meme maniere, sauf les colonnes qui n'existent
 # qu'apres le nettoyage (admin1_label/admin2_label/admin3_label sont conservees - voir remove_cols ci-dessus)
@@ -507,7 +544,10 @@ remove_cols_raw <- c(
 remove_cols_raw <- intersect(remove_cols_raw, colnames(raw_data_all))
 
 raw_data_all_validation <- select(raw_data_all, -all_of(remove_cols_raw))
-if ("_index" %in% colnames(raw_data_all_validation)) raw_data_all_validation <- rename(raw_data_all_validation, id = `_index`)
+# voir rename_index_to_id ci-dessus (clean_data_final) - meme garde contre la collision "_id"/"_index"
+if ("_index" %in% colnames(raw_data_all_validation) && !"id" %in% colnames(raw_data_all_validation)) {
+  raw_data_all_validation <- rename(raw_data_all_validation, id = `_index`)
+}
 
 ################################################################################
 # CONSTRUCTION DU CLASSEUR FINAL SELON LE MODELE DE LA CHECKLIST

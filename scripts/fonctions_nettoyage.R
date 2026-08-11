@@ -39,8 +39,19 @@ green <- function(x) x
 # mensuels les auront deja, donc la synthese ci-dessous ne se declenche que comme solution de repli
 # pour des donnees qui ne les ont pas.
 
+## as.Date()/as.POSIXct() sur une chaine qui RESSEMBLE a un nombre (ex. "46239.488067129627", le
+## numero de serie Excel d'une date exportee par Kobo en XLS - readxl col_types="text" renvoie ce
+## numero brut plutot qu'une date formatee pour toute colonne mise en forme "date" dans le fichier
+## Excel source) ne renvoie PAS juste NA + warning comme pour une chaine illisible ordinaire : elles
+## LEVENT UNE ERREUR ("character string is not in a standard unambiguous format"), que
+## suppressWarnings() ne peut pas intercepter puisque ce n'est pas un warning. Cette erreur casse tout
+## le mutate() vectorise (une seule valeur en cause suffit a faire echouer toute la colonne, ligne par
+## ligne). tryCatch() ici traite ce cas comme un echec total du parsing "normal", pour que TOUTES les
+## valeurs de la colonne passent alors par le repli "numero de serie Excel" (openxlsx::convertToDate/
+## convertToDateTime) - le cas reel observe sur un export Kobo XLS telecharge directement (vu sur
+## _submission_time/start/end/today/date).
 parse_kobo_date <- function(x) {
-  out <- suppressWarnings(as.Date(x))
+  out <- tryCatch(suppressWarnings(as.Date(x)), error = function(e) rep(as.Date(NA), length(x)))
   needs_fallback <- is.na(out) & !is.na(x) & x != ""
   if (any(needs_fallback)) {
     out[needs_fallback] <- suppressWarnings(openxlsx::convertToDate(as.numeric(x[needs_fallback])))
@@ -49,7 +60,7 @@ parse_kobo_date <- function(x) {
 }
 
 parse_kobo_datetime <- function(x) {
-  out <- suppressWarnings(as.POSIXct(x, tz = "UTC"))
+  out <- tryCatch(suppressWarnings(as.POSIXct(x, tz = "UTC")), error = function(e) rep(as.POSIXct(NA), length(x)))
   needs_fallback <- is.na(out) & !is.na(x) & x != ""
   if (any(needs_fallback)) {
     out[needs_fallback] <- suppressWarnings(openxlsx::convertToDateTime(as.numeric(x[needs_fallback])))

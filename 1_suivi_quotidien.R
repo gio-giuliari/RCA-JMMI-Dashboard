@@ -86,7 +86,11 @@ remove_cols_raw <- c(
 )
 remove_cols_raw <- intersect(remove_cols_raw, colnames(raw_data_all))
 raw_data_export <- select(raw_data_all, -all_of(remove_cols_raw))
-if ("_index" %in% colnames(raw_data_export)) raw_data_export <- rename(raw_data_export, id = `_index`)
+# "_id" a deja ete renommee "id" dans read_raw_data() si presente - ne renommer "_index" en "id" que
+# si ce n'est pas deja le cas, sinon collision si l'export a les deux (voir 2_nettoyage_final.R)
+if ("_index" %in% colnames(raw_data_export) && !"id" %in% colnames(raw_data_export)) {
+  raw_data_export <- rename(raw_data_export, id = `_index`)
+}
 
 ################################################################################
 # ECRITURE DU CLASSEUR
