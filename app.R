@@ -3,25 +3,47 @@
 ################################################################################
 # Ce dossier est AUTONOME (self-contained) : 1_suivi_quotidien.R, 2_nettoyage_final.R, 3_relabel_choices.R,
 # scripts/ et ressources/ sont des COPIES des projets rca_jmmi_cleaning et jmmi_relabelling (sources
-# d'origine, a cote), placees ici pour que ce dossier puisse etre deploye/zippe/partage seul, sans
-# dependre des dossiers voisins a l'execution.
+# d'origine, a cote), placees ici pour que ce dossier puisse etre deploye/publie seul (ex. Posit
+# Connect/shinyapps.io), sans dependre des dossiers voisins a l'execution.
 # Si le pipeline de rca_jmmi_cleaning ou l'outil jmmi_relabelling evoluent, il faut recopier ces fichiers
 # ici pour rester a jour (pas de synchronisation automatique).
-# A chaque clic sur "Lancer", l'app copie ces scripts/ressources dans un dossier temporaire isole
-# (propre a cette execution), y place les fichiers importes par l'utilisateur, ecrit un .Renviron
-# pointant vers ces fichiers, puis lance le script demande dans un PROCESSUS R SEPARE (Rscript.exe) -
-# exactement comme en ligne de commande. Cela evite toute pollution de l'environnement global de l'app
-# Shiny et isole totalement les executions les unes des autres.
+# A chaque clic sur "Lancer", l'app copie ces scripts/ressources dans un dossier temporaire isole (propre
+# a cette execution), y place les fichiers importes par l'utilisateur, puis EXECUTE le script demande
+# DANS LA MEME SESSION R QUE L'APP SHINY (voir run_script_inprocess() plus bas) - pas de sous-processus
+# Rscript.exe separe, pour rester compatible avec un deploiement Shiny standard (Posit Connect,
+# shinyapps.io, Shiny Server) ou seule cette session R est disponible. L'isolation entre executions est
+# obtenue via un environnement R frais (new.env()) a chaque appel plutot que via un processus separe.
 ################################################################################
 
 library(shiny)
 library(shinyjs)
 library(shinythemes)
 library(htmltools)
+library(openxlsx)
+# packages utilises par les scripts du pipeline (1_suivi_quotidien.R, 2_nettoyage_final.R,
+# 3_relabel_choices.R, scripts/*.R), maintenant executes dans cette meme session R (voir
+# run_script_inprocess()) - declares ici pour que la publication (ex. rsconnect::deployApp()) les
+# detecte et les installe sur le serveur.
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(openxlsx2)
+library(cleaningtools)
+library(labelled)
+# utilises par 4_analyse_complete.R (analyse descriptive + PMAS/MEB + Score de Fonctionnalite) -
+# analysistools/presentresults sont, comme cleaningtools, des paquets IMPACT installes depuis GitHub
+# (pas le CRAN) : verifier qu'ils sont bien geles dans le meme manifeste de deploiement que cleaningtools
+# (voir la note sur Posit Connect/shinyapps.io en tete de fichier).
+library(analysistools)
+library(presentresults)
+library(srvyr)
+# plyr n'est JAMAIS attache via library() ici expres - il n'est utilise que via plyr::rbind.fill()
+# (namespace qualifie) dans 2_nettoyage_final.R, car plyr masque des fonctions dplyr (rename,
+# summarise, ...) utilisees SANS prefixe ailleurs dans le pipeline. rsconnect detecte quand meme la
+# dependance a partir de l'appel plyr:: lui-meme, pas besoin de library(plyr) pour ca.
 
 ## chemins fixes ---------------------------------------------------------------------------------
 PIPELINE_ROOT <- normalizePath(".")
-RSCRIPT_PATH <- "C:/Program Files/R/R-4.5.3/bin/Rscript.exe"
 CHECKLIST_TEMPLATE_NAME <- "Checklist-Template_Nettoyage-Donnees-Quant_Normes-Min_v1_2_2026-03_FRENCH.xlsx"
 
 #### UI DEFINITION ####
@@ -67,7 +89,9 @@ ui <- shiny::bootstrapPage(
               div(class = "blue-line"),
               div(class = "info-row", "2. Suivi quotidien / Nettoyage : importez le jeu de donn\u00e9es brutes et l'outil Kobo. Pour le nettoyage, choisissez \"Pour suivi\" la premi\u00e8re fois (cr\u00e9e le classeur \u00e0 faire remplir par l'\u00e9quipe de suivi), puis \"Finale\" une fois ce classeur rempli (\u00e0 importer en plus) pour produire le classeur final."),
               div(class = "blue-line"),
-              div(class = "info-row", "3. \u00c9tiquetage des choix : importez l'outil Kobo et le classeur nettoy\u00e9 (sortie de l'\u00e9tape \"Finale\" ci-dessus) pour remplacer les codes de r\u00e9ponse par leurs libell\u00e9s.")
+              div(class = "info-row", "3. \u00c9tiquetage des choix : importez l'outil Kobo et le classeur nettoy\u00e9 (sortie de l'\u00e9tape \"Finale\" ci-dessus) pour remplacer les codes de r\u00e9ponse par leurs libell\u00e9s."),
+              div(class = "blue-line"),
+              div(class = "info-row", "4. Analyse mensuelle : importez le classeur nettoy\u00e9 (sortie de l'\u00e9tape \"Finale\", PAS le classeur \u00e9tiquet\u00e9) pour produire l'analyse compl\u00e8te (statistiques descriptives, PMAS/MEB, Score de Fonctionnalit\u00e9 des March\u00e9s). L'outil Kobo n'est pas \u00e0 r\u00e9importer : il est d\u00e9j\u00e0 inclus dans ce classeur (feuilles \"survey\"/\"choices\").")
             ),
 
             br(),
@@ -80,9 +104,10 @@ ui <- shiny::bootstrapPage(
                   choiceNames = list(
                     HTML("Suivi quotidien<span class=\"pill-sub\">(collecte en cours)</span>"),
                     HTML("Nettoyage des donn\u00e9es<span class=\"pill-sub\">(fin de collecte)</span>"),
-                    HTML("\u00c9tiquetage des choix<span class=\"pill-sub\">(post-nettoyage/validation)</span>")
+                    HTML("Analyse mensuelle<span class=\"pill-sub\">(post-nettoyage)</span>"),
+                    HTML("\u00c9tiquetage des choix<span class=\"pill-sub\">(post-analyse)</span>")
                   ),
-                  choiceValues = list("suivi", "nettoyage", "etiquetage")
+                  choiceValues = list("suivi", "nettoyage", "analyse", "etiquetage")
                 )
               ),
               conditionalPanel(
@@ -102,14 +127,40 @@ ui <- shiny::bootstrapPage(
               div(class = "step-title", "Etape 2 - Fichiers"),
               fluidRow(
                 conditionalPanel(
-                  condition = "input.mode_select != 'etiquetage'",
+                  condition = "input.mode_select != 'etiquetage' && input.mode_select != 'analyse'",
                   column(6, fileInput("file_raw", "Jeu de donn\u00e9es brutes (export Kobo, .xlsx)", accept = ".xlsx", width = "100%"))
                 ),
                 conditionalPanel(
-                  condition = "input.mode_select == 'etiquetage'",
+                  condition = "input.mode_select == 'etiquetage' || input.mode_select == 'analyse'",
                   column(6, fileInput("file_clean_data", "Base des don\u00e9es nettoy\u00e9e (sortie de l'\u00e9tape \"Finale\", .xlsx)", accept = ".xlsx", width = "100%"))
                 ),
-                column(6, fileInput("file_kobo", "Outil Kobo (survey/choices, .xlsx)", accept = ".xlsx", width = "100%"))
+                conditionalPanel(
+                  condition = "input.mode_select != 'analyse'",
+                  column(6, fileInput("file_kobo", "Outil Kobo (survey/choices, .xlsx)", accept = ".xlsx", width = "100%"))
+                )
+              )
+            ),
+
+            ## ETAPE 3 - classeur precedent (uniquement nettoyage + pour_suivi) ----------------------
+            ## Permet de relancer "pour_suivi" sur des donnees qui se sont agrandies (collecte encore
+            ## en cours) sans perdre le travail de revue deja fait : les decisions deja prises pour les
+            ## enquetes deja presentes avant sont reprises automatiquement dans le nouveau classeur
+            ## (statut "Repris (deja traite)", voir carry_forward_decisions() dans
+            ## scripts/fonctions_nettoyage.R), au lieu de devoir copier-coller a la main entre deux
+            ## classeurs.
+            conditionalPanel(
+              condition = "input.mode_select == 'nettoyage' && input.submode_select == 'pour_suivi'",
+              div(class = "step-box",
+                div(class = "step-title", "Etape 3 - Nettoyage precedent (optionnel)"),
+                checkboxInput("has_previous_review",
+                  "Un nettoyage précédent existe-t-il pour ces données ? (collecte encore en cours, ce classeur est régénéré sur des données qui se sont agrandies)",
+                  value = FALSE),
+                conditionalPanel(
+                  condition = "input.has_previous_review == true",
+                  div(class = "info-row", style = "margin-bottom:10px;",
+                    "Importez le classeur \"suivi à vérifier\" précédent (même format, rempli en partie ou en totalité) : les décisions déjà prises pour les enquêtes déjà présentes avant seront reprises automatiquement dans le nouveau classeur, seules les nouvelles lignes resteront à remplir. Les lignes déjà tapées dans Journal_additionnel/Journal_suppression sont également recopiées."),
+                  fileInput("file_previous_review", "Classeur \"suivi à vérifier\" précédent (.xlsx)", accept = ".xlsx", width = "100%")
+                )
               )
             ),
 
@@ -118,7 +169,42 @@ ui <- shiny::bootstrapPage(
               condition = "input.mode_select == 'nettoyage' && input.submode_select == 'finale'",
               div(class = "step-box",
                 div(class = "step-title", "Etape 3 - Classeur rempli par l'\u00e9quipe de suivi"),
+                div(class = "info-row", style = "margin-bottom:10px;",
+                  "Le classeur \"suivi \u00e0 v\u00e9rifier\" (feuille \"Lisez_moi\") inclut d\u00e9sormais le journal de nettoyage additionnel (onglets Journal_additionnel/Journal_suppression) - pour une correction manuelle non signal\u00e9e par la revue automatique, remplissez-les directement dans ce m\u00eame classeur avant de le r\u00e9importer ici."),
                 fileInput("file_filled", "Classeur \"suivi \u00e0 v\u00e9rifier\" rempli (.xlsx)", accept = ".xlsx", width = "100%")
+              )
+            ),
+
+            ## ETAPE 3 - parametres de l'analyse (uniquement mode analyse) -----------------------------
+            ## L'annee/le mois du cycle ne sont plus demandes ici : ils sont detectes automatiquement
+            ## depuis la colonne "date" du classeur nettoye importe (voir get_assessment_period_from_data()
+            ## dans scripts/fonctions_analyse.R) - cette information est deja presente dans le classeur
+            ## (nom de fichier ET feuille README), inutile de la faire retaper.
+            conditionalPanel(
+              condition = "input.mode_select == 'analyse'",
+              div(class = "step-box",
+                div(class = "step-title", "Etape 3 - Comparaison optionnelle au mois précédent"),
+                div(class = "info-row", style = "margin-bottom:10px;",
+                  "Pour comparer le coût des paniers à celui du mois précédent (feuille \"Evolution des paniers du PMAS\") : importez le classeur final nettoyé de ce mois précédent et indiquez son nom. Laissez vide pour ignorer cette comparaison - la feuille sera alors laissée vide."),
+                fluidRow(
+                  column(3, textInput("analyse_mois_precedent", "Mois précédent (ex. Juillet)", width = "100%")),
+                  column(6, fileInput("file_analyse_previous", "Classeur final nettoyé du mois précédent (.xlsx, optionnel)", accept = ".xlsx", width = "100%"))
+                )
+              ),
+
+              ## explication de la methodologie de suffisance des donnees utilisee pour le calcul du PMAS
+              ## (feuille "Coût médian du PMAS") - constantes correspondantes dans
+              ## scripts/fonctions_analyse.R : MEB_MIN_OBS_DEFAULT/MEB_MIN_OBS_OVERRIDE, MEB_TOTAL_MIN_ITEMS,
+              ## MEB_BASKET_MIN_STANDALONE, MEB_BASKET_MIN_CAUTION.
+              div(class = "info-box",
+                div(class = "info-title", "Comment le PMAS est calculé (feuille \"Coût médian du PMAS\")"),
+                div(class = "info-row", "1. Prix médian par article : à chaque niveau (Commune, Sous-Préfecture, Préfecture, National), le prix médian d'un article n'est calculé à partir des prix collectés localement que s'il y a au moins 3 prix disponibles pour cet article à ce niveau - sauf pour la viande de bœuf, où 1 seul prix suffit."),
+                div(class = "blue-line"),
+                div(class = "info-row", "2. PMAS total : calculé seulement si au moins 12 des 17 articles ont un prix médian local suffisant (règle 1). Les articles restants (jusqu'à 5) sont alors complétés par la médiane nationale de cet article, pour pouvoir quand même calculer un total complet."),
+                div(class = "blue-line"),
+                div(class = "info-row", "3. Moins de 12 articles disponibles localement : le PMAS total n'est PAS calculé, mais chaque panier est calculé séparément dès que son propre seuil est atteint - panier alimentaire si au moins 6 des 9 produits alimentaires sont disponibles, panier non alimentaire si au moins 4 des 6 produits sont disponibles, panier d'hygiène si les 2 produits sont disponibles (les articles manquants dans un panier calculé sont complétés par la médiane nationale). Une note l'indique dans la colonne \"Note\"."),
+                div(class = "blue-line"),
+                div(class = "info-row", "4. Entre 12 et 14 articles disponibles : le PMAS total est calculé, mais si un panier a été calculé avec peu de prix locaux (moins de 6/9 pour l'alimentaire, 4/6 pour le non alimentaire, ou 1/2 pour l'hygiène), une note invite à interpréter ce panier avec prudence.")
               )
             ),
 
@@ -155,10 +241,65 @@ ui <- shiny::bootstrapPage(
   )
 )
 
-## construit et lance une execution isolee du pipeline dans un sous-dossier temporaire + un processus
-## Rscript.exe separe (jamais l'environnement de l'app Shiny elle-meme). Fonction de haut niveau
-## (hors server()) pour pouvoir etre testee independamment de l'app.
-run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL) {
+## variables d'environnement lues (via Sys.getenv()) par les scripts du pipeline et leur configuration
+## commune (scripts/0_configuration.R) - remises a "non definies" avant CHAQUE execution (voir
+## run_script_inprocess()) pour qu'une valeur laissee par l'execution PRECEDENTE ne persiste pas par
+## erreur (ex. additional_cleaning_log defini lors d'un "Lancer", absent au suivant).
+ALL_PIPELINE_ENV_VARS <- c(
+  "kobo", "raw_dataset", "logical_checks", "eur_xrate", "usd_xrate", "checklist_template",
+  "final_workbook_dir", "suivi_final_a_remplir_dir", "suivi_final_remplis_path",
+  "suivi_final_remplis_pattern", "previous_review_path",
+  "kobo_tool_file", "clean_data_file", "output_dir",
+  "analyse_mois_precedent", "analyse_previous_clean_data_file"
+)
+
+## execute un script du pipeline DANS LA SESSION R DE L'APP SHINY (pas de sous-processus Rscript.exe -
+## voir la note d'en-tete) : isolation via un environnement frais (new.env()) plutot qu'un processus
+## separe, variables de configuration passees via Sys.setenv() (equivalent du .Renviron ecrit
+## auparavant pour un sous-processus), et capture de tout ce que le script imprime (cat()/print()/
+## warning()) - via sink() vers un fichier temporaire - pour l'afficher dans le "Journal d'execution".
+## Les erreurs stop() du script sont interceptees (tryCatch) plutot que de faire planter l'app entiere.
+run_script_inprocess <- function(script_path, wd, env_vars = character(0)) {
+  old_wd <- getwd()
+  setwd(wd)
+  on.exit(setwd(old_wd), add = TRUE)
+
+  Sys.unsetenv(ALL_PIPELINE_ENV_VARS)
+  if (length(env_vars) > 0) do.call(Sys.setenv, as.list(env_vars))
+  on.exit(Sys.unsetenv(ALL_PIPELINE_ENV_VARS), add = TRUE)
+
+  log_file <- tempfile(fileext = ".log")
+  con <- file(log_file, open = "wt")
+  sink(con, type = "output")
+  sink(con, type = "message")
+
+  env <- new.env()
+  result <- tryCatch({
+    source(script_path, local = env, echo = FALSE)
+    list(ok = TRUE, error_message = NULL)
+  }, error = function(e) {
+    list(ok = FALSE, error_message = conditionMessage(e))
+  }, finally = {
+    sink(type = "message")
+    sink(type = "output")
+    close(con)
+  })
+
+  log_lines <- if (file.exists(log_file)) readLines(log_file, warn = FALSE) else character(0)
+  unlink(log_file)
+  if (!result$ok) log_lines <- c(log_lines, paste("Erreur :", result$error_message))
+
+  # error_message renvoye SEPAREMENT du log complet (pas seulement noye dedans) pour que le message
+  # d'erreur affiche a l'ecran (result_summary, voir diagnose_error()) puisse l'inclure directement,
+  # plutot que de forcer l'utilisateur a deplier le journal d'execution pour voir le detail (uuid/
+  # variable concernes, etc.) des erreurs de validation ligne par ligne (stop() avec message detaille).
+  list(ok = result$ok, log = paste(log_lines, collapse = "\n"), error_message = result$error_message)
+}
+
+## construit et lance une execution isolee du pipeline dans un sous-dossier temporaire, EN PROCESSUS
+## (voir run_script_inprocess()). Fonction de haut niveau (hors server()) pour pouvoir etre testee
+## independamment de l'app.
+run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL, previous_review_path = NULL) {
 
   script_basename <- if (kind == "suivi") "1_suivi_quotidien" else "2_nettoyage_final"
 
@@ -179,6 +320,24 @@ run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL) {
   file.copy(file.path(PIPELINE_ROOT, paste0(script_basename, ".R")),
             file.path(tmp, paste0(script_basename, ".R")), overwrite = TRUE)
 
+  # verification explicite que les ressources embarquees (pas les fichiers importes par l'utilisateur)
+  # sont bien presentes ET non vides APRES la copie - sinon file.copy() echoue silencieusement
+  # (renvoie FALSE sans erreur) si la source n'existe pas, ce qui produirait plus tard une erreur
+  # generique et trompeuse ("fichier importe corrompu") au moment de lire ces fichiers, alors que le
+  # vrai probleme est que ressources/ n'a pas ete inclus lors de la publication de l'app (ex. Posit
+  # Connect) - message precis ici pour eviter de faire chercher le probleme du mauvais cote.
+  required_resources <- c(
+    file.path(tmp, "ressources", "check_list_august.xlsx"),
+    file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME),
+    file.path(tmp, paste0(script_basename, ".R"))
+  )
+  missing_resources <- required_resources[!file.exists(required_resources) | file.size(required_resources) %in% c(0, NA)]
+  if (length(missing_resources) > 0) {
+    stop("Fichier(s) de configuration manquant(s) ou vide(s) dans le deploiement de l'application : ",
+        paste(basename(missing_resources), collapse = ", "),
+        " - le dossier ressources/ (et les scripts .R) n'ont probablement pas ete inclus lors de la publication.")
+  }
+
   # fichiers importes par l'utilisateur (noms fixes, quel que soit le nom d'origine)
   file.copy(raw_data_path, file.path(tmp, "input", "raw_data.xlsx"), overwrite = TRUE)
   file.copy(kobo_path, file.path(tmp, "ressources", "kobo_tool.xlsx"), overwrite = TRUE)
@@ -188,31 +347,35 @@ run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL) {
     file.copy(filled_path, file.path(tmp, "output", "3_classeurs_remplis", "classeur_suivi_a_verifier.xlsx"), overwrite = TRUE)
   }
 
-  # .Renviron propre a cette execution - lu automatiquement par le sous-processus R au demarrage
-  # (CWD = tmp), exactement comme en ligne de commande
-  env_lines <- c(
-    paste0('kobo = "', file.path(tmp, "ressources", "kobo_tool.xlsx"), '"'),
-    paste0('raw_dataset = "', file.path(tmp, "input", "raw_data.xlsx"), '"'),
-    paste0('logical_checks = "', file.path(tmp, "ressources", "check_list_august.xlsx"), '"'),
-    'eur_xrate = 655.95',
-    paste0('checklist_template = "', file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME), '"'),
-    paste0('final_workbook_dir = "', file.path(tmp, "output", "4_final_donnees_nettoyees"), '/"'),
-    paste0('suivi_final_a_remplir_dir = "', file.path(tmp, "output", "2_a_verifier"), '/"'),
-    paste0('suivi_final_remplis_path = "', file.path(tmp, "output", "3_classeurs_remplis"), '/"'),
-    'suivi_final_remplis_pattern = "classeur_suivi_a_verifier.xlsx$"'
-  )
-  writeLines(env_lines, file.path(tmp, ".Renviron"))
+  # classeur "suivi a verifier" d'un tour PRECEDENT du pipeline (etape "pour_suivi" uniquement -
+  # collecte encore en cours, ce nouveau classeur va etre regenere sur des donnees qui se sont
+  # agrandies) : voir carry_forward_decisions() dans scripts/fonctions_nettoyage.R, appelee depuis
+  # 2_nettoyage_final.R quand previous_review_path (ci-dessous) est renseigne.
+  if (!is.null(previous_review_path)) {
+    file.copy(previous_review_path, file.path(tmp, "input", "previous_review.xlsx"), overwrite = TRUE)
+  }
 
-  old_wd <- getwd()
-  setwd(tmp)
-  on.exit(setwd(old_wd), add = TRUE)
-
-  log_out <- tryCatch(
-    system2(RSCRIPT_PATH, args = shQuote(paste0(script_basename, ".R")), stdout = TRUE, stderr = TRUE),
-    error = function(e) paste("ERREUR AU LANCEMENT DE R :", conditionMessage(e))
+  # variables de configuration lues par le script via Sys.getenv() (voir run_script_inprocess())
+  env_vars <- c(
+    kobo = file.path(tmp, "ressources", "kobo_tool.xlsx"),
+    raw_dataset = file.path(tmp, "input", "raw_data.xlsx"),
+    logical_checks = file.path(tmp, "ressources", "check_list_august.xlsx"),
+    eur_xrate = "655.95",
+    usd_xrate = "570",   # parite XAF/USD flottante (contrairement a l'euro) - a mettre a jour periodiquement
+    checklist_template = file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME),
+    final_workbook_dir = paste0(file.path(tmp, "output", "4_final_donnees_nettoyees"), "/"),
+    suivi_final_a_remplir_dir = paste0(file.path(tmp, "output", "2_a_verifier"), "/"),
+    suivi_final_remplis_path = paste0(file.path(tmp, "output", "3_classeurs_remplis"), "/"),
+    suivi_final_remplis_pattern = "classeur_suivi_a_verifier.xlsx$",
+    # chaine vide (pas simplement omise) si non fourni : coherent avec Sys.getenv() qui renvoie "" pour
+    # une variable non definie - previous_review_path est de toute facon deja remise a "non definie"
+    # avant CHAQUE execution par Sys.unsetenv(ALL_PIPELINE_ENV_VARS) (voir run_script_inprocess()).
+    previous_review_path = if (!is.null(previous_review_path)) file.path(tmp, "input", "previous_review.xlsx") else ""
   )
-  status <- attr(log_out, "status")
-  ok <- is.null(status) || identical(status, 0L)
+
+  res <- run_script_inprocess(file.path(tmp, paste0(script_basename, ".R")), wd = tmp, env_vars = env_vars)
+  ok <- res$ok
+  log_out <- res$log
 
   out_dir <- switch(kind,
     suivi = file.path(tmp, "output", "1_suivi_couverture_et_prix"),
@@ -232,7 +395,7 @@ run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL) {
     log_out <- c(log_out, "Le script s'est termin\u00e9 sans erreur mais aucun fichier de sortie attendu n'a \u00e9t\u00e9 trouv\u00e9.")
   }
 
-  list(ok = ok, log = paste(log_out, collapse = "\n"), file = output_file)
+  list(ok = ok, log = paste(log_out, collapse = "\n"), file = output_file, error_message = res$error_message)
 }
 
 ## nom de fichier sur - conserve le nom original importe par l'utilisateur (pour que le fichier de
@@ -246,9 +409,9 @@ safe_input_filename <- function(name) {
   paste0(base, ".xlsx")
 }
 
-## meme principe que run_pipeline() (dossier temporaire isole + processus Rscript.exe separe), mais
-## pour l'outil de re-etiquetage des choix (independant du pipeline de nettoyage lui-meme : prend en
-## entree le classeur nettoye deja produit, pas les donnees brutes).
+## meme principe que run_pipeline() (dossier temporaire isole, execution EN PROCESSUS - voir
+## run_script_inprocess()), mais pour l'outil de re-etiquetage des choix (independant du pipeline de
+## nettoyage lui-meme : prend en entree le classeur nettoye deja produit, pas les donnees brutes).
 run_relabel_pipeline <- function(clean_data_path, clean_data_name, kobo_path) {
 
   tmp <- file.path(tempdir(), paste0("jmmi_relabel_", gsub("[^0-9]", "", format(Sys.time(), "%Y%m%d%H%M%OS3"))))
@@ -268,23 +431,15 @@ run_relabel_pipeline <- function(clean_data_path, clean_data_name, kobo_path) {
   file.copy(clean_data_path, file.path(tmp, "input", clean_data_filename), overwrite = TRUE)
   file.copy(kobo_path, file.path(tmp, "input", "kobo_tool.xlsx"), overwrite = TRUE)
 
-  env_lines <- c(
-    paste0('kobo_tool_file = "', file.path(tmp, "input", "kobo_tool.xlsx"), '"'),
-    paste0('clean_data_file = "', file.path(tmp, "input", clean_data_filename), '"'),
-    paste0('output_dir = "', file.path(tmp, "output"), '/"')
+  env_vars <- c(
+    kobo_tool_file = file.path(tmp, "input", "kobo_tool.xlsx"),
+    clean_data_file = file.path(tmp, "input", clean_data_filename),
+    output_dir = paste0(file.path(tmp, "output"), "/")
   )
-  writeLines(env_lines, file.path(tmp, ".Renviron"))
 
-  old_wd <- getwd()
-  setwd(tmp)
-  on.exit(setwd(old_wd), add = TRUE)
-
-  log_out <- tryCatch(
-    system2(RSCRIPT_PATH, args = shQuote("3_relabel_choices.R"), stdout = TRUE, stderr = TRUE),
-    error = function(e) paste("ERREUR AU LANCEMENT DE R :", conditionMessage(e))
-  )
-  status <- attr(log_out, "status")
-  ok <- is.null(status) || identical(status, 0L)
+  res <- run_script_inprocess(file.path(tmp, "3_relabel_choices.R"), wd = tmp, env_vars = env_vars)
+  ok <- res$ok
+  log_out <- res$log
 
   out_dir <- file.path(tmp, "output")
   files <- if (dir.exists(out_dir)) list.files(out_dir, pattern = "_final\\.xlsx$", full.names = TRUE) else character()
@@ -295,7 +450,83 @@ run_relabel_pipeline <- function(clean_data_path, clean_data_name, kobo_path) {
     log_out <- c(log_out, "Le script s'est terminé sans erreur mais aucun fichier de sortie attendu n'a été trouvé.")
   }
 
-  list(ok = ok, log = paste(log_out, collapse = "\n"), file = output_file)
+  list(ok = ok, log = paste(log_out, collapse = "\n"), file = output_file, error_message = res$error_message)
+}
+
+## meme principe que run_relabel_pipeline() (dossier temporaire isole, execution EN PROCESSUS), pour
+## l'analyse mensuelle complete (descriptive + PMAS/MEB + Score de Fonctionnalite) : prend en entree le
+## classeur final deja produit par le nettoyage (pas les donnees brutes). L'annee/le mois du cycle sont
+## detectes automatiquement depuis ce classeur (voir get_assessment_period_from_data() dans
+## scripts/fonctions_analyse.R), pas passes ici. `previous_clean_path`/`previous_mois` sont optionnels
+## (NULL) - voir 4_analyse_complete.R : la feuille "Evolution des paniers du PMAS" reste vide si absents.
+## Pas de parametre kobo_path : l'outil kobo n'est PAS reimporte separement, ses feuilles "survey"/
+## "choices" sont deja clonees telles quelles dans clean_data_path par build_final_workbook() (voir
+## scripts/fonctions_nettoyage.R) - on les reextrait ci-dessous plutot que de redemander a l'utilisateur
+## un fichier qu'il a deja fourni a l'etape de nettoyage.
+run_analyse_pipeline <- function(clean_data_path,
+                                 previous_clean_path = NULL, previous_mois = NULL) {
+
+  tmp <- file.path(tempdir(), paste0("jmmi_analyse_", gsub("[^0-9]", "", format(Sys.time(), "%Y%m%d%H%M%OS3"))))
+  dir.create(file.path(tmp, "input"), recursive = TRUE)
+  dir.create(file.path(tmp, "scripts"), recursive = TRUE)
+  dir.create(file.path(tmp, "output"), recursive = TRUE)
+
+  file.copy(file.path(PIPELINE_ROOT, "scripts", "fonctions_analyse.R"),
+            file.path(tmp, "scripts", "fonctions_analyse.R"), overwrite = TRUE)
+  file.copy(file.path(PIPELINE_ROOT, "scripts", "mfs.R"),
+            file.path(tmp, "scripts", "mfs.R"), overwrite = TRUE)
+  file.copy(file.path(PIPELINE_ROOT, "4_analyse_complete.R"),
+            file.path(tmp, "4_analyse_complete.R"), overwrite = TRUE)
+
+  required_resources <- c(
+    file.path(tmp, "scripts", "fonctions_analyse.R"),
+    file.path(tmp, "scripts", "mfs.R"),
+    file.path(tmp, "4_analyse_complete.R")
+  )
+  missing_resources <- required_resources[!file.exists(required_resources) | file.size(required_resources) %in% c(0, NA)]
+  if (length(missing_resources) > 0) {
+    stop("Fichier(s) de configuration manquant(s) ou vide(s) dans le deploiement de l'application : ",
+        paste(basename(missing_resources), collapse = ", "),
+        " - le dossier scripts/ (et les fichiers .R) n'ont probablement pas ete inclus lors de la publication.")
+  }
+
+  file.copy(clean_data_path, file.path(tmp, "input", "clean_data.xlsx"), overwrite = TRUE)
+
+  kobo_sheets <- tryCatch(readxl::excel_sheets(clean_data_path), error = function(e) character(0))
+  if (!all(c("survey", "choices") %in% kobo_sheets)) {
+    stop("Le classeur nettoyé importé ne contient pas les feuilles \"survey\"/\"choices\" attendues - importez le classeur produit par l'étape \"Finale\" du nettoyage (pas un autre fichier).")
+  }
+  kobo_survey_raw <- readxl::read_excel(clean_data_path, sheet = "survey", col_types = "text")
+  kobo_choices_raw <- readxl::read_excel(clean_data_path, sheet = "choices", col_types = "text")
+  writexl::write_xlsx(list(survey = kobo_survey_raw, choices = kobo_choices_raw),
+                      file.path(tmp, "input", "kobo_tool.xlsx"))
+
+  env_vars <- c(
+    clean_data_file = file.path(tmp, "input", "clean_data.xlsx"),
+    kobo_tool_file = file.path(tmp, "input", "kobo_tool.xlsx"),
+    eur_xrate = "655.95",
+    output_dir = paste0(file.path(tmp, "output"), "/")
+  )
+  if (!is.null(previous_clean_path)) {
+    file.copy(previous_clean_path, file.path(tmp, "input", "previous_clean_data.xlsx"), overwrite = TRUE)
+    env_vars["analyse_previous_clean_data_file"] <- file.path(tmp, "input", "previous_clean_data.xlsx")
+    env_vars["analyse_mois_precedent"] <- if (!is.null(previous_mois)) previous_mois else ""
+  }
+
+  res <- run_script_inprocess(file.path(tmp, "4_analyse_complete.R"), wd = tmp, env_vars = env_vars)
+  ok <- res$ok
+  log_out <- res$log
+
+  out_dir <- file.path(tmp, "output")
+  files <- if (dir.exists(out_dir)) list.files(out_dir, pattern = "_CAR_JMMI_Dataset_Analyse_.*\\.xlsx$", full.names = TRUE) else character()
+  output_file <- if (length(files) > 0) files[1] else NULL
+
+  if (ok && is.null(output_file)) {
+    ok <- FALSE
+    log_out <- c(log_out, "Le script s'est terminé sans erreur mais aucun fichier de sortie attendu n'a été trouvé.")
+  }
+
+  list(ok = ok, log = paste(log_out, collapse = "\n"), file = output_file, error_message = res$error_message)
 }
 
 ## traduit le journal d'exécution technique (texte brut du sous-processus Rscript.exe) en un diagnostic
@@ -331,10 +562,24 @@ ERROR_PATTERNS <- list(
     action = "Importez le fichier REACH_CAR_Dataset_JMMI_<Mois>-<Année>.xlsx téléchargé à la fin de l'étape \"Finale\" du nettoyage, puis relancez l'étiquetage."
   ),
   list(
-    pattern = "ERREUR AU LANCEMENT DE R",
-    titre = "Impossible de démarrer le moteur R",
-    message = "L'application n'a pas réussi à lancer le processus R qui exécute le traitement (Rscript.exe).",
-    action = "Ce n'est pas un problème avec vos fichiers - contactez la personne en charge de l'installation du tableau de bord (chemin de R probablement introuvable ou modifié)."
+    pattern = "Le journal de nettoyage additionnel contient des erreurs",
+    kinds = "finale",
+    titre = "Erreurs dans le journal de nettoyage additionnel",
+    message = "L'onglet Journal_additionnel ou Journal_suppression du classeur \"suivi à vérifier\" rempli contient une ou plusieurs lignes invalides - le détail complet (numéro de ligne, identifiant d'enquête, variable concernée) est indiqué dans le journal d'exécution ci-dessous.",
+    action = "Corrigez chaque ligne signalée dans le journal d'exécution ci-dessous, réenregistrez le classeur, puis réimportez-le."
+  ),
+  list(
+    pattern = "n'a pas les colonnes attendues",
+    kinds = "finale",
+    titre = "Onglet Journal_additionnel/Journal_suppression modifié",
+    message = "L'onglet Journal_additionnel ou Journal_suppression du classeur \"suivi à vérifier\" rempli n'a pas les colonnes attendues.",
+    action = "N'ajoutez/ne renommez pas de colonnes dans ces onglets - repartez du classeur \"suivi à vérifier\" tel qu'il a été généré, puis réimportez-le."
+  ),
+  list(
+    pattern = "Fichier\\(s\\) de configuration manquant\\(s\\) ou vide\\(s\\)",
+    titre = "Fichiers de l'application manquants",
+    message = "Un fichier interne à l'application (dans ressources/ ou un des scripts .R) est manquant ou vide sur le serveur - ce n'est pas un problème avec vos fichiers importés.",
+    action = "Vérifiez que TOUT le contenu du dossier de l'application (y compris ressources/ et les fichiers .R) a bien été inclus lors de la publication, puis republiez l'application."
   ),
   list(
     pattern = "not found in workbook|Sheet .* not found|n'existe pas dans (ce|le) classeur",
@@ -367,45 +612,82 @@ ERROR_PATTERNS <- list(
     titre = "Aucun classeur final produit",
     message = "Le traitement s'est déroulé sans erreur technique, mais n'a pas produit de classeur final - le plus souvent parce que le classeur \"suivi à vérifier\" importé ne correspond pas à celui généré à la première exécution (fichier renommé, ou provenant d'un autre jeu de données).",
     action = "Réimportez le classeur \"suivi à vérifier\" tel qu'il a été téléchargé et rempli, sans le renommer, en vous assurant qu'il correspond bien au même fichier de données brutes que la première exécution."
+  ),
+  list(
+    pattern = "Classeur d'entree introuvable : le classeur final nettoye",
+    kinds = "analyse",
+    titre = "Mauvais fichier importé pour l'analyse",
+    message = "Le fichier importé comme \"classeur final nettoyé\" n'a pas pu être utilisé. Cette étape attend en entrée le classeur FINAL produit par le nettoyage (\"Nettoyage des données\" > \"Finale\"), pas les données brutes ni un autre type de fichier.",
+    action = "Importez le fichier REACH_CAR_Dataset_JMMI_<Mois>-<Année>.xlsx téléchargé à la fin de l'étape \"Finale\" du nettoyage, puis relancez l'analyse."
+  ),
+  list(
+    pattern = "The following analysis variables are not present",
+    kinds = "analyse",
+    titre = "Outil kobo incompatible avec le classeur importé",
+    message = "L'outil kobo importé décrit des questions qui n'existent pas dans le classeur final importé - l'outil kobo ne correspond probablement pas à celui utilisé pour produire ce classeur.",
+    action = "Vérifiez que l'outil kobo importé est bien la version utilisée pour produire CE classeur final, puis réessayez."
+  ),
+  list(
+    pattern = "Taux de change XAF/EUR invalide",
+    kinds = "analyse",
+    titre = "Taux de change invalide",
+    message = "Le taux de change XAF/EUR configuré dans l'application n'est pas un nombre valide.",
+    action = "Contactez la personne en charge du tableau de bord - il s'agit d'un problème de configuration de l'application, pas de vos fichiers importés."
   )
 )
 
-diagnose_error <- function(kind, log_text) {
+## `error_message` (optionnel) : le message exact du stop() qui a interrompu le script (voir
+## run_script_inprocess()) - pour les erreurs de validation ligne par ligne (voir fonctions_nettoyage.R,
+## ex. validate_additional_cleaning_log(), read_review_sheet()), ce message contient deja le detail
+## precis (uuid, variable, valeur en cause) pour CHAQUE ligne fautive. Toujours affiche directement dans
+## le message a l'ecran plutot que de forcer l'utilisateur a deplier le journal d'execution pour le voir.
+diagnose_error <- function(kind, log_text, error_message = NULL) {
+  diag <- NULL
   for (p in ERROR_PATTERNS) {
     if (!is.null(p$kinds) && !identical(kind, "") && !(kind %in% p$kinds)) next
     if (grepl(p$pattern, log_text, ignore.case = TRUE)) {
-      return(list(titre = p$titre, message = p$message, action = p$action))
+      diag <- list(titre = p$titre, message = p$message, action = p$action)
+      break
     }
   }
 
-  generic_message <- switch(kind,
-    suivi = "Causes fréquentes : le fichier de données brutes ne correspond pas à l'outil Kobo importé, ou la colonne \"date\" est manquante/mal renseignée.",
-    pour_suivi = "Causes fréquentes : le fichier de données brutes ne correspond pas à l'outil Kobo importé, ou un fichier n'est pas au format .xlsx attendu.",
-    finale = "Causes fréquentes : le classeur \"suivi à vérifier\" ne correspond pas au même fichier de données brutes que la première exécution, ou une ligne du classeur rempli est incohérente (voir le journal ci-dessous pour l'identifiant d'enquête concerné).",
-    etiquetage = "Causes fréquentes : le classeur nettoyé importé ne provient pas de l'étape \"Finale\" du nettoyage, ou l'outil Kobo importé ne correspond pas à ces données.",
-    "Causes fréquentes : fichiers importés au mauvais endroit, fichier non conforme au format .xlsx, ou incohérence entre les données et l'outil Kobo."
-  )
+  if (is.null(diag)) {
+    generic_message <- switch(kind,
+      suivi = "Causes fréquentes : le fichier de données brutes ne correspond pas à l'outil Kobo importé, ou la colonne \"date\" est manquante/mal renseignée.",
+      pour_suivi = "Causes fréquentes : le fichier de données brutes ne correspond pas à l'outil Kobo importé, ou un fichier n'est pas au format .xlsx attendu.",
+      finale = "Causes fréquentes : le classeur \"suivi à vérifier\" ne correspond pas au même fichier de données brutes que la première exécution, ou une ligne du classeur rempli est incohérente (voir le détail ci-dessous pour l'identifiant d'enquête concerné).",
+      etiquetage = "Causes fréquentes : le classeur nettoyé importé ne provient pas de l'étape \"Finale\" du nettoyage, ou l'outil Kobo importé ne correspond pas à ces données.",
+      analyse = "Causes fréquentes : le classeur nettoyé importé ne provient pas de l'étape \"Finale\" du nettoyage (il doit contenir les feuilles \"survey\"/\"choices\"), ou le classeur du mois précédent (optionnel) n'est pas le bon fichier.",
+      "Causes fréquentes : fichiers importés au mauvais endroit, fichier non conforme au format .xlsx, ou incohérence entre les données et l'outil Kobo."
+    )
 
-  list(
-    titre = "Erreur inattendue",
-    message = paste("Une erreur est survenue pendant le traitement.", generic_message),
-    action = "Vérifiez vos fichiers importés puis réessayez. Si le problème persiste, transmettez le journal d'exécution ci-dessous à la personne en charge du tableau de bord."
-  )
+    diag <- list(
+      titre = "Erreur inattendue",
+      message = paste("Une erreur est survenue pendant le traitement.", generic_message),
+      action = "Vérifiez vos fichiers importés puis réessayez. Si le problème persiste, transmettez le journal d'exécution ci-dessous à la personne en charge du tableau de bord."
+    )
+  }
+
+  if (!is.null(error_message) && nzchar(error_message)) {
+    diag$message <- paste0(diag$message, "\n\nDétail : ", error_message)
+  }
+
+  diag
 }
 
 #### SERVER ####
 server <- function(input, output, session) {
 
-  result <- reactiveValues(ok = NA, log = "", file = NULL, kind = NULL)
+  result <- reactiveValues(ok = NA, log = "", file = NULL, kind = NULL, error_message = NULL)
 
   observeEvent(input$run, {
 
-    if (is.null(input$file_kobo)) {
+    if (input$mode_select != "analyse" && is.null(input$file_kobo)) {
       showNotification("Veuillez importer l'outil Kobo.", type = "error")
       return(invisible())
     }
 
-    if (identical(input$mode_select, "etiquetage")) {
+    if (input$mode_select %in% c("etiquetage", "analyse")) {
       if (is.null(input$file_clean_data)) {
         showNotification("Veuillez importer le classeur nettoy\u00e9.", type = "error")
         return(invisible())
@@ -415,7 +697,7 @@ server <- function(input, output, session) {
       return(invisible())
     }
 
-    kind <- if (input$mode_select == "suivi") "suivi" else if (input$mode_select == "etiquetage") "etiquetage" else input$submode_select
+    kind <- if (input$mode_select == "suivi") "suivi" else if (input$mode_select %in% c("etiquetage", "analyse")) input$mode_select else input$submode_select
     if (input$mode_select == "nettoyage" && is.null(input$submode_select)) {
       showNotification("Veuillez choisir 'Pour suivi' ou 'Finale'.", type = "error")
       return(invisible())
@@ -424,7 +706,10 @@ server <- function(input, output, session) {
       showNotification("Veuillez importer le classeur rempli par l'\u00e9quipe de suivi.", type = "error")
       return(invisible())
     }
-
+    if (identical(kind, "pour_suivi") && isTRUE(input$has_previous_review) && is.null(input$file_previous_review)) {
+      showNotification("Veuillez importer le classeur \"suivi \u00e0 v\u00e9rifier\" pr\u00e9c\u00e9dent, ou d\u00e9cochez la case.", type = "error")
+      return(invisible())
+    }
     shinyjs::runjs("$('#loading-spinner').show();")
     result$ok <- NA
     result$file <- NULL
@@ -436,14 +721,23 @@ server <- function(input, output, session) {
           clean_data_name = input$file_clean_data$name,
           kobo_path = input$file_kobo$datapath
         )
+      } else if (identical(kind, "analyse")) {
+        run_analyse_pipeline(
+          clean_data_path = input$file_clean_data$datapath,
+          previous_clean_path = if (!is.null(input$file_analyse_previous)) input$file_analyse_previous$datapath else NULL,
+          previous_mois = if (nzchar(trimws(input$analyse_mois_precedent))) trimws(input$analyse_mois_precedent) else NULL
+        )
       } else {
         run_pipeline(kind,
           raw_data_path = input$file_raw$datapath,
           kobo_path = input$file_kobo$datapath,
-          filled_path = if (identical(kind, "finale")) input$file_filled$datapath else NULL
+          filled_path = if (identical(kind, "finale")) input$file_filled$datapath else NULL,
+          previous_review_path = if (identical(kind, "pour_suivi") && isTRUE(input$has_previous_review) &&
+                                     !is.null(input$file_previous_review)) input$file_previous_review$datapath else NULL
         )
       },
-      error = function(e) list(ok = FALSE, log = paste("Erreur :", conditionMessage(e)), file = NULL)
+      error = function(e) list(ok = FALSE, log = paste("Erreur :", conditionMessage(e)), file = NULL,
+                               error_message = conditionMessage(e))
     )
 
     shinyjs::runjs("$('#loading-spinner').hide();")
@@ -452,6 +746,7 @@ server <- function(input, output, session) {
     result$log <- res$log
     result$file <- res$file
     result$kind <- kind
+    result$error_message <- res$error_message
 
     if (isTRUE(res$ok)) {
       showNotification("Termin\u00e9 - le fichier est pr\u00eat au t\u00e9l\u00e9chargement.", type = "message")
@@ -473,7 +768,7 @@ server <- function(input, output, session) {
         div(class = "info-row", paste0("Fichier pr\u00eat : ", basename(result$file)))
       )
     } else {
-      diag <- diagnose_error(result$kind, result$log)
+      diag <- diagnose_error(result$kind, result$log, result$error_message)
       div(class = "red-box",
         div(class = "red-title", diag$titre),
         div(class = "red-row", diag$message),

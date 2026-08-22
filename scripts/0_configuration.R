@@ -37,8 +37,8 @@ options(dplyr.summarise.inform = FALSE)
 #-------------------------------------------------------------------------------
 # chargement des fonctions
 #-------------------------------------------------------------------------------
-source("scripts/fonctions_verification_outil_kobo.R")
-source("scripts/fonctions_nettoyage.R")
+source("scripts/fonctions_verification_outil_kobo.R", local = TRUE)
+source("scripts/fonctions_nettoyage.R", local = TRUE)
 
 #-------------------------------------------------------------------------------
 # chargement de l'outil KOBO

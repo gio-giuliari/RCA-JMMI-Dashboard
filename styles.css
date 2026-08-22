@@ -130,6 +130,9 @@ body, .content-wrapper, .shiny-text-output, .info-box, .red-box, p, div, span, t
 .red-row {
   color: #b30000;
   margin-bottom: 10px;
+  /* diagnose_error() peut inclure un detail multi-lignes (une entree par ligne fautive, uuid/variable) -
+     sans ceci les retours a la ligne du message seraient ecrases par le comportement HTML par defaut. */
+  white-space: pre-wrap;
 }
 .red-line {
   background-color: #ffcccc;

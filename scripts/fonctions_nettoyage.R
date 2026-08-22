@@ -161,6 +161,78 @@ get_assessment_period <- function(df, date_col = "date"){
 }
 
 #############################################################################################################
+# RECALCUL DES CHAMPS "CALCULATE" KOBO LIES AU PRIX (<item>_price_item)
+#############################################################################################################
+# create_clean_data() applique les corrections du journal de nettoyage champ par champ (ex.
+# <item>_price_unit_item, <item>_std_unit_item, <item>_other_unit_item - voir "A verifier" / 2eme partie
+# de 2_nettoyage_final.R, ou ces variables sont desormais affichees ensemble comme un bloc modifiable
+# pour chaque article), mais ne re-execute PAS les formules "calculate" de l'outil kobo : la valeur de
+# <item>_price_item resterait donc celle calculee par Kobo au moment de la collecte, jamais mise a jour
+# si l'une de ses variables source est corrigee. recompute_price_items() (appelee depuis
+# 2_nettoyage_final.R juste apres l'application du journal de nettoyage) resout ce probleme en
+# reevaluant directement les formules kobo elles-memes - dynamiquement, depuis kobo_survey$calculation,
+# plutot qu'une liste d'articles codee en dur, pour qu'un nouvel article ajoute a l'outil soit pris en
+# compte automatiquement.
+
+# Traduit une formule "calculate" XLSForm (syntaxe de l'outil kobo, ex. "round(if(${x}='non',
+# (${y} div ${z}),${y}),0)") en expression R evaluable : ${var} -> reference de colonne (df[["var"]]),
+# div -> /, = (comparaison XLSForm, jamais une assignation dans ce contexte) -> ==, 'texte' -> "texte",
+# if(...) -> ifelse(...). Couvre exactement les constructions utilisees par les formules _price_item/
+# _price_unit_item de cet outil, pas un analyseur XLSForm general.
+translate_xlsform_formula <- function(formula) {
+  f <- formula
+  f <- str_replace_all(f, "\\$\\{(\\w+)\\}", 'df[["\\1"]]')
+  f <- str_replace_all(f, "\\bdiv\\b", "/")
+  f <- str_replace_all(f, "(?<![=<>!])=(?!=)", "==")
+  f <- str_replace_all(f, "'", '"')
+  f <- str_replace_all(f, "\\bif\\(", "ifelse(")
+  f
+}
+
+# Reevalue un seul champ "calculate" (ex. <item>_price_item, ou son eventuel intermediaire
+# <item>_<taille>_price_unit_item) a partir de sa formule kobo et des donnees ACTUELLES de df (qui
+# peuvent avoir ete corrigees par le journal de nettoyage). Renvoie NA partout si une variable
+# referencee par la formule est absente de df (garde-fou, plutot que de faire planter tout le script).
+recompute_calculate_field <- function(df, formula) {
+  if (is.na(formula) || !nzchar(formula)) return(rep(NA_real_, nrow(df)))
+  vars_used <- str_remove_all(unlist(str_extract_all(formula, "\\$\\{\\w+\\}")), "[${}]")
+  if (length(setdiff(vars_used, colnames(df))) > 0) return(rep(NA_real_, nrow(df)))
+  expr <- translate_xlsform_formula(formula)
+  as.numeric(eval(parse(text = expr), envir = list(df = df)))
+}
+
+# Recalcule TOUS les <item>_price_item (et leurs eventuels intermediaires <item>_<taille>_
+# price_unit_item, ex. soap_200g_price_unit_item) directement depuis les variables source ACTUELLES de
+# df. 2 passes (les intermediaires d'abord, puis les _price_item qui peuvent les referencer) plutot
+# qu'une resolution generale de dependances - aucun intermediaire observe dans l'outil ne depend d'un
+# AUTRE intermediaire, une chaine a 2 niveaux suffit pour la structure actuelle.
+recompute_price_items <- function(df, kobo_survey) {
+  price_item_fields <- kobo_survey %>% filter(type == "calculate", str_ends(name, "_price_item"))
+  if (nrow(price_item_fields) == 0) return(df)
+
+  referenced_vars <- str_remove_all(unlist(str_extract_all(price_item_fields$calculation, "\\$\\{\\w+\\}")), "[${}]")
+  intermediate_fields <- kobo_survey %>%
+    filter(type == "calculate", name %in% referenced_vars, str_ends(name, "_price_unit_item"))
+  intermediate_referenced <- str_remove_all(unlist(str_extract_all(intermediate_fields$calculation, "\\$\\{\\w+\\}")), "[${}]")
+
+  # coercion numerique de toute variable REFERENCEE par une formule (sauf les select_one, type
+  # std_unit_item, comparees a une chaine 'oui'/'non' - jamais utilisees dans un calcul arithmetique)
+  select_one_vars <- kobo_survey$name[str_starts(kobo_survey$type, "select_one")]
+  numeric_vars <- setdiff(unique(c(referenced_vars, intermediate_referenced, price_item_fields$name)), select_one_vars)
+  for (v in intersect(numeric_vars, colnames(df))) df[[v]] <- suppressWarnings(as.numeric(df[[v]]))
+
+  for (i in seq_len(nrow(intermediate_fields))) {
+    fname <- intermediate_fields$name[i]
+    if (fname %in% colnames(df)) df[[fname]] <- recompute_calculate_field(df, intermediate_fields$calculation[i])
+  }
+  for (i in seq_len(nrow(price_item_fields))) {
+    fname <- price_item_fields$name[i]
+    if (fname %in% colnames(df)) df[[fname]] <- recompute_calculate_field(df, price_item_fields$calculation[i])
+  }
+  df
+}
+
+#############################################################################################################
 # Fonctions cleaningtools modifiees
 #############################################################################################################
 check_value_modified <- function(dataset,
@@ -334,15 +406,33 @@ add_to_cleaning_log_other_recode <- function(x){
 add_to_cleaning_log_other_recode_one <- function(x){
   change_type <- "Recoding other response"
 
+  # une question select_one ne peut avoir qu'UNE seule valeur : si l'equipe de suivi a rempli plusieurs
+  # colonnes EXISTANT autre par erreur (x$existing_other est alors plusieurs libelles joints par ";",
+  # voir 2_nettoyage_final.R), on ne bloque pas tout le traitement pour autant - seul le PREMIER choix
+  # est retenu (VRAI autre reste sans effet ici, il n'est jamais utilise par cette fonction) et les
+  # autres sont juste signales dans un avertissement, pas une erreur.
+  existing_parts <- str_split(x$existing_other, ";")[[1]]
+  if (length(existing_parts) > 1) {
+    warning(paste0("Cette variable est une question a choix UNIQUE (select_one) mais plusieurs choix ",
+                   "EXISTANT autre ont ete selectionnes en meme temps (classeur suivi a verifier, feuille ",
+                   "reponses_autres) - uuid=", x$uuid, ", variable=", x$ref_name,
+                   " : seul le premier est retenu ('", trimws(existing_parts[1]),
+                   "'), ignore(s) : '", paste(trimws(existing_parts[-1]), collapse = "', '"), "'."))
+  }
+  existing_choice <- trimws(existing_parts[1])
+
   # retirer le texte de la reponse
   df <- data.frame(uuid=x$uuid, question=x$name, change_type=change_type,
                    old_value=x$response, new_value=NA)
   cleaning_log_other <<- rbind(cleaning_log_other, df)
 
-  # recoder le choix
-  new_value <- get_name_from_label(x$list_name, x$existing_other)
+  # recoder le choix (uniquement le premier choix retenu, voir ci-dessus)
+  new_value <- get_name_from_label(x$list_name, existing_choice)
   if (length(new_value)!=1){
-    stop(paste0("Le choix n'est pas dans la liste : ", x$uuid, "; ", x$list_name, "; ", x$existing_other))
+    stop(paste0("Le choix '", existing_choice, "' n'existe pas dans la liste de reponses '", x$list_name,
+               "' : uuid=", x$uuid, ", variable=", x$ref_name, ", question 'autre'=", x$name,
+               " (classeur suivi a verifier, feuille reponses_autres) - verifiez l'orthographe exacte ",
+               "du libelle choisi."))
   } else{
     df <- data.frame(uuid=x$uuid, question=x$ref_name, change_type=change_type,
                      old_value=get_value_from_uuid(x$uuid, x$ref_name), new_value=new_value)
@@ -457,170 +547,229 @@ select_multiple_add_remove <- function(el, to_remove, to_add=c()){
   return(cl %>% mutate(change_type=el$change_type))
 }
 ################################################################################
-# Ajoute la feuille des reponses "autre" (+ sa feuille "Listes_deroulantes" de validation) a un
-# classeur existant plutot que d'en creer un nouveau - permet de combiner ce contenu avec la feuille
-# "A_verifier" des verifications (voir write_review_sheet() / 2_nettoyage_final.R) dans un seul
-# classeur "a verifier", au lieu de deux fichiers separes. L'appelant cree/charge
-# `wb` et sauvegarde le classeur combine lui-meme une fois toutes les feuilles ajoutees.
-add_other_responses_sheet <- function(wb, df, sheet_name = "reponses_autres") {
+# LISTES DEROULANTES (post-traitement openxlsx2 - voir apply_classic_dropdowns() ci-dessous)
+################################################################################
+# openxlsx::dataValidation() ecrit TOUJOURS les validations de type "list" au format d'extension
+# Excel 2010+ ("x14", range dans <extLst>) des qu'une plage de cellules est referencee - meme pour une
+# reference sur la MEME feuille, et meme pour une liste litterale en ligne (verifie empiriquement :
+# aucune des 3 formes n'obtient le <dataValidation> classique avec cette version d'openxlsx). Google
+# Sheets et certaines versions de LibreOffice ignorent silencieusement ce format x14 : le fichier
+# s'ouvre normalement mais aucune liste deroulante n'apparait, alors que le code semble correct et
+# qu'Excel 2010+ les affiche sans probleme. openxlsx2, en revanche, ecrit le format <dataValidation>
+# classique (verifie empiriquement, y compris pour des references inter-feuilles et des plages non
+# contigues) - pris en charge par tous les tableurs. Plutot que de reconstruire toute la feuille avec
+# openxlsx2 (API de mise en forme totalement differente, risque de perdre la protection/le figeage/les
+# styles qu'openxlsx sait deja faire correctement), les listes deroulantes sont enregistrees ici (au
+# lieu d'appeler openxlsx::dataValidation() directement) puis ajoutees en un seul post-traitement,
+# apres la sauvegarde complete du classeur par openxlsx - voir apply_classic_dropdowns(), appelee apres
+# saveWorkbook() dans 2_nettoyage_final.R.
+PENDING_DROPDOWN_VALIDATIONS <- list()
 
-  get_column_letter <- function(r) openxlsx::int2col(r)
-
-  # noms de feuille Excel limites a 31 caracteres
-  dropdown_sheet <- substr(paste0("Listes_", sheet_name), 1, 31)
-
-  # definir les styles
-  style.col.color <- createStyle(fgFill = "#DDDDDE", border = "TopBottomLeftRight",
-                                 valign = "top", wrapText = T)
-  style.col.color1 <- createStyle(fgFill = "#DBD5C6", border = "TopBottomLeftRight", borderColour = "#000000",
-                                  valign = "top", wrapText = T)
-  style.col.color2 <- createStyle(fgFill = "#F3F4F4", border = "TopBottomLeftRight",
-                                  valign = "top", wrapText = T)
-  style.col.color.first <- createStyle(textDecoration = "bold", fgFill = "#F1797A", valign = "top",
-                                       border = "TopBottomLeftRight", borderColour = "#000000", wrapText = T)
-
-  # En-tetes en francais pour l'equipe de suivi - purement pour l'affichage : le reste de cette
-  # fonction continue de travailler avec les noms de colonnes internes de `df` (df$question_name,
-  # etc.), seule cette copie ecrite dans le classeur porte les libelles francais.
-  # 2_nettoyage_final.R (2eme passe) retraduit ces libelles vers les noms internes a la lecture (voir
-  # la-bas).
-  header_fr <- c(
-    q_type = "type_question", list_name = "liste_choix", question_name = "nom_question",
-    full_label = "libelle_complet", response = "reponse", selected_choices = "choix_selectionnes",
-    "TRUE other (copy response or provide a better translation)" = "VRAI autre (copier la reponse ou fournir une meilleure traduction)",
-    "EXISTING other 1 (select the most appropriate choice)" = "EXISTANT autre 1 (choisir la reponse la plus appropriee)",
-    "EXISTING other 2 (select the most appropriate choice)" = "EXISTANT autre 2 (choisir la reponse la plus appropriee)",
-    "EXISTING other 3 (select the most appropriate choice)" = "EXISTANT autre 3 (choisir la reponse la plus appropriee)",
-    "INVALID other (select yes or leave blank)" = "INVALIDE autre (selectionner oui ou laisser vide)",
-    "FOLLOW-UP message (what is unclear about this response?)" = "Message de SUIVI (qu'est-ce qui n'est pas clair dans cette reponse ?)",
-    "Explanation" = "Explication"
+# `rows` n'est pas necessairement contigue (ex. write_review_sheet() : les lignes signalees pour une
+# meme liste de choix peuvent etre dispersees dans le classeur, pas triees par variable) - mais quand
+# elles LE SONT (cas courant de add_other_responses_sheet() : df_other est trie par question_name, donc
+# toutes les lignes d'une meme question se suivent), les regrouper en une seule plage "colX:colY" au
+# lieu d'une reference "colX:colX" par ligne individuelle jointes par des virgules - un sqref avec des
+# dizaines de plages a une seule cellule est inutilement long/fragile (risque reel qu'Excel ignore
+# silencieusement la validation plutot que de lever une erreur claire), pour un resultat strictement
+# equivalent.
+queue_list_validation <- function(sheet_name, col, rows, list_range) {
+  if (length(rows) == 0) return(invisible(NULL))
+  col_letter <- openxlsx::int2col(col)
+  rows_sorted <- sort(unique(rows))
+  run_id <- cumsum(c(TRUE, diff(rows_sorted) != 1))
+  run_start <- tapply(rows_sorted, run_id, min)
+  run_end <- tapply(rows_sorted, run_id, max)
+  # attribut "sqref" de type ST_Sqref (xsd:list) dans le schema OOXML : plusieurs plages doivent etre
+  # separees par un ESPACE, jamais par une virgule (regle generale xsd:list, pas specifique a Excel) -
+  # confirme via openpyxl (parseur independant d'openxlsx/openxlsx2, qui rejette explicitement un sqref
+  # joint par des virgules alors qu'un XML generique comme xml2::read_xml()/openxlsx2::wb_load() ne
+  # detecte rien, puisque c'est syntaxiquement du XML bien forme, juste invalide vis-a-vis du schema).
+  # C'etait la cause reelle des classeurs "a reparer" sous Excel : le seul endroit de ce script ou
+  # plusieurs plages A UNE SEULE CELLULE (donc necessairement jointes, jamais fusionnables en une plage
+  # colX:colY) sont systematiquement generees est la liste deroulante "_std_unit_item" (oui/non) de
+  # write_review_sheet() pour "Verification_prix" - une ligne "contexte" dispersee par bloc de prix, PAS
+  # triee/regroupee comme add_other_responses_sheet() peut l'etre - d'ou un classeur systematiquement
+  # invalide pour cet onglet specifiquement, jamais pour "A_verifier".
+  dims <- paste0(col_letter, run_start, ":", col_letter, run_end, collapse = " ")
+  PENDING_DROPDOWN_VALIDATIONS[[length(PENDING_DROPDOWN_VALIDATIONS) + 1]] <<- list(
+    sheet = sheet_name, dims = dims, value = list_range
   )
-  df_display <- df
-  match_idx <- match(names(df_display), names(header_fr))
-  names(df_display)[!is.na(match_idx)] <- header_fr[match_idx[!is.na(match_idx)]]
+  invisible(NULL)
+}
 
-  # ajouter la feuille
+# A appeler UNE FOIS, apres saveWorkbook() (openxlsx) - recharge le fichier deja sauvegarde avec
+# openxlsx2 (sans toucher a la mise en forme/protection deja ecrite par openxlsx, voir plus haut),
+# ajoute toutes les listes deroulantes enregistrees via queue_list_validation() au format classique, et
+# re-sauvegarde au meme chemin.
+apply_classic_dropdowns <- function(path) {
+  if (length(PENDING_DROPDOWN_VALIDATIONS) == 0) return(invisible(NULL))
+  wb2 <- openxlsx2::wb_load(path)
+  for (spec in PENDING_DROPDOWN_VALIDATIONS) {
+    wb2 <- wb2$add_data_validation(sheet = spec$sheet, dims = spec$dims, type = "list", value = spec$value)
+  }
+  wb2$save(path)
+  invisible(NULL)
+}
+
+################################################################################
+# En-tetes affiches (colonne A) <- nom de colonne technique - memes colonnes de contexte (commune,
+# partenaire, date, enqueteur, boutique) que REVIEW_HEADERS_FR pour "3_A_verifier"/"4_Verification_prix"
+# (demande utilisateur, pour les memes reperes d'une feuille a l'autre). DEUX colonnes distinctes pour la
+# nouvelle reponse plutot qu'une seule (demande explicite de l'utilisateur) : "texte libre" (aucune
+# validation, pour "Reecrire" - accepte aussi plusieurs choix separes par ";" si "Reattribuer" porte sur
+# une question a choix multiples, la liste deroulante ne pouvant selectionner qu'un seul choix a la
+# fois) et "choix existant" (liste deroulante, pour "Reattribuer" a un seul choix - le cas courant).
+# Excel ne permet pas de verrouiller/deverrouiller une cellule DYNAMIQUEMENT selon la valeur d'une autre
+# cellule sans macro VBA (ecartees ici, comme partout ailleurs dans ce classeur, pour eviter les
+# avertissements de securite/l'incompatibilite avec Google Sheets/LibreOffice) - les deux colonnes
+# restent donc techniquement modifiables en permanence, mais une mise en forme conditionnelle (voir
+# add_other_responses_sheet()) grise celle qui ne correspond pas a l'action choisie, pour qu'il reste
+# sans ambiguite laquelle remplir.
+# row_id/statut : voir carry_forward_decisions() plus bas - meme principe que dans REVIEW_HEADERS_FR
+# (identifiant stable d'une ligne + indicateur "deja traite au tour precedent" ou "nouveau"), colonnes
+# techniques (ne pas modifier).
+OTHER_HEADERS_FR <- c(
+  uuid = "Identifiant enquete (ne pas modifier)",
+  row_id = "ID (ne pas modifier)",
+  commune = "Commune",
+  partenaire = "Partenaire",
+  date = "Date",
+  enqueteur = "Enqueteur",
+  boutique = "Boutique / vendeur",
+  q_type = "Type de question (ne pas modifier)",
+  list_name = "Liste de choix (ne pas modifier)",
+  question_name = "Variable (ne pas modifier)",
+  full_label = "Question (ne pas modifier)",
+  selected_choices = "Choix deja selectionnes (ne pas modifier)",
+  response = "Reponse \"autre\" actuelle (ne pas modifier)",
+  statut = "Statut (ne pas modifier)",
+  action = "Que faire ? (obligatoire)",
+  new_value_text = "Nouvelle reponse - texte libre (si Reecrire ; ou Reattribuer a plusieurs choix, separes par ;)",
+  new_value_choice = "Nouvelle reponse - choix existant (si Reattribuer a un seul choix)"
+)
+
+# Options de la liste deroulante "Que faire ?" (feuille reponses_autres) <- valeur technique interne -
+# meme principe que ACTION_LABELS_FR pour "A_verifier". "Reattribuer..." remplace l'ancien systeme a 3
+# colonnes "EXISTANT autre 1/2/3" (un seul champ "Nouvelle reponse" suffit desormais) ; "Supprimer"
+# remplace "INVALIDE autre". "Ne rien changer" (comme no_action dans ACTION_LABELS_FR) : une reponse
+# "autre" flaguee n'a pas forcement besoin d'etre recodee/reecrite/supprimee - elle peut deja etre
+# valable telle quelle. Aucun traitement PASSE 2 special requis : les lignes dont action_code vaut
+# "no_action" (ou est encore vide) ne correspondent a aucun des filtres or_remove/or_reassign/or_rewrite
+# dans 2_nettoyage_final.R, donc ne produisent naturellement aucune entree de cleaning_log - la seule
+# difference est que l'option est desormais EXPLICITE (choix delibere plutot qu'une ligne juste oubliee).
+OTHER_ACTION_LABELS_FR <- c(
+  no_action = "Ne rien changer",
+  rewrite = "Reecrire",
+  reassign = "Reattribuer a un choix existant",
+  remove = "Supprimer"
+)
+
+# Ajoute la feuille des reponses "autre" (+ sa feuille "Listes_..." de validation) a un classeur
+# existant - meme principe que write_review_sheet()/A_verifier : feuille consolidee en langage simple,
+# une seule liste deroulante "Que faire ?", colonnes techniques grisees verrouillees.
+add_other_responses_sheet <- function(wb, df, sheet_name = "5_Reponses_autres") {
+  # capture AVANT le select()/rename ci-dessous (list_name n'est pas forcement affiche sous ce nom une
+  # fois passe dans df_display) - reutilise plus bas pour regrouper les lignes par liste de choix kobo,
+  # meme principe que block_id dans write_review_sheet().
+  list_name_raw <- df$list_name
+
+  df_display <- df %>% select(names(OTHER_HEADERS_FR))
+  colnames(df_display) <- unname(OTHER_HEADERS_FR[colnames(df_display)])
+  df_display <- sanitize_df_text(df_display)
+
   addWorksheet(wb, sheet_name)
-  writeData(wb = wb, x = df_display, sheet = sheet_name, startRow = 1)
+  writeData(wb, sheet_name, df_display, colNames = TRUE)
 
-  # appliquer les styles
-  addStyle(wb, sheet_name, style = style.col.color.first, rows = 1:(nrow(df) + 1), cols = 1) # couleur de la premiere colonne
-  addStyle(wb, sheet_name, style = style.col.color2, rows = 1:(nrow(df) + 1), cols = 14)
-  addStyle(wb, sheet_name, style = style.col.color, rows = 1:(nrow(df) + 1), cols = 15)
-  addStyle(wb, sheet_name, style = style.col.color1, rows = 1:(nrow(df) + 1), cols = 16)
-  addStyle(wb, sheet_name, style = style.col.color1, rows = 1:(nrow(df) + 1), cols = 17)
-  addStyle(wb, sheet_name, style = style.col.color1, rows = 1:(nrow(df) + 1), cols = 18)
-  addStyle(wb, sheet_name, style = style.col.color, rows = 1:(nrow(df) + 1), cols = 19)
-  addStyle(wb, sheet_name, style = style.col.color2, rows = 1:(nrow(df) + 1), cols = 20)
-  addStyle(wb, sheet_name, style = style.col.color2, rows = 1:(nrow(df) + 1), cols = 21)
+  # n vaut 1 (donc data_rows une plage vide) quand df a 0 ligne - cas reel (aucune reponse "autre" a
+  # recoder), pas seulement theorique. Sans ce garde-fou, 2:1 (sequence DESCENDANTE) retoucherait aussi
+  # la ligne d'en-tete.
+  n <- nrow(df_display) + 1
+  data_rows <- if (n >= 2) 2:n else integer(0)
+  col_of_display <- function(key) match(OTHER_HEADERS_FR[[key]], colnames(df_display))
+  action_col <- col_of_display("action")
+  new_value_text_col <- col_of_display("new_value_text")
+  new_value_choice_col <- col_of_display("new_value_choice")
+  editable_cols <- c(action_col, new_value_text_col, new_value_choice_col)
+  technical_cols <- setdiff(seq_len(ncol(df_display)), editable_cols)
 
-  # geler la premiere ligne
-  freezePane(wb, sheet = sheet_name, firstActiveRow = 2)
+  addStyle(wb, sheet_name, style = createStyle(fgFill = RED_HEADER, fontColour = "#FFFFFF",
+                                               textDecoration = "bold", wrapText = TRUE, valign = "center",
+                                               halign = "center"), rows = 1, cols = 1:ncol(df_display))
+  freezePane(wb, sheet_name, firstActiveRow = 2, firstActiveCol = 2)
+  addFilter(wb, sheet_name, rows = 1, cols = 1:ncol(df_display))
 
-  # ajouter les filtres de colonne
-  addFilter(wb, sheet_name, rows = 1, cols = 1:ncol(df))
+  addStyle(wb, sheet_name, style = createStyle(wrapText = TRUE, valign = "top", locked = FALSE),
+          rows = data_rows, cols = editable_cols, gridExpand = TRUE)
+  addStyle(wb, sheet_name, style = createStyle(fgFill = GREY_HEADER, fontColour = "#595959", wrapText = TRUE,
+                                               valign = "top", locked = TRUE),
+          rows = data_rows, cols = technical_cols, gridExpand = TRUE)
 
-  addStyle(wb, sheet_name, style = createStyle(wrapText = TRUE), rows = 1:21, cols = 1)
+  # liste deroulante "Que faire ?" - liste en ligne (4 options, largement sous la limite de 255
+  # caracteres d'Excel pour une liste litterale).
+  action_choices <- paste0('"', paste(unname(OTHER_ACTION_LABELS_FR), collapse = ","), '"')
+  queue_list_validation(sheet_name, col = action_col, rows = data_rows, list_range = action_choices)
 
-  # ajouter la feuille des valeurs de liste deroulante et la validation des donnees - cachee (visible =
-  # FALSE) car elle ne sert que de source aux listes deroulantes ci-dessous, l'equipe de suivi n'a jamais
-  # besoin de l'ouvrir directement
-  addWorksheet(wb, dropdown_sheet, visible = FALSE)
-  for (r in seq_len(nrow(other_db))) {
+  # liste deroulante pour "Nouvelle reponse - choix existant" : chaque ligne recoit la liste des choix
+  # VALIDES DE SA PROPRE question - meme principe que "Nouvelle reponse" dans write_review_sheet()/
+  # A_verifier (feuille cachee "Listes_...", une colonne par liste de choix kobo, une plage par liste
+  # jointe en une seule liste deroulante par regroupement de lignes contigues), mais sans avoir besoin de
+  # get_variable_choice_list() : list_name est deja une colonne technique de other_db (voir
+  # list_name_raw ci-dessus). "Nouvelle reponse - texte libre" (aucune validation) reste le champ a
+  # utiliser pour "Reecrire", ou pour "Reattribuer" une question a choix multiples a PLUSIEURS choix a la
+  # fois (la liste deroulante n'en insere qu'un seul, limitation Excel) - voir OTHER_HEADERS_FR plus haut.
+  choice_lists_sheet <- substr(paste0("Listes_", sheet_name), 1, 31)
+  addWorksheet(wb, choice_lists_sheet, visible = FALSE)
 
-    if (other_db$q_type[r] != "text") {
+  if (length(data_rows) > 0) {
+    unique_lists <- unique(list_name_raw[!is.na(list_name_raw) & nzchar(list_name_raw)])
+    for (li in seq_along(unique_lists)) {
+      list_name <- unique_lists[li]
+      choice_labels <- kobo_choices$label[kobo_choices$list_name == list_name]
+      choice_labels <- choice_labels[!is.na(choice_labels) & nzchar(choice_labels)]
+      if (length(choice_labels) == 0) next
 
-      choices <- str_split(other_db$choices[r], ";;")[[1]]
-      choices <- choices[choices != ""]
+      writeData(wb, choice_lists_sheet, choice_labels, startCol = li)
+      col_letter <- openxlsx::int2col(li)
+      list_values <- paste0("'", choice_lists_sheet, "'!$", col_letter, "$1:$", col_letter,
+                            "$", length(choice_labels))
 
-      if (length(choices) == 0) next
-
-      writeData(wb, dropdown_sheet, choices, startCol = r)
-
-      uuids <- which(df$question_name == other_db$name[r])
-      if (length(uuids) == 0) next
-
-      col_letter <- get_column_letter(r)
-      n_choices <- length(choices)
-
-      values <- paste0(
-        "'", dropdown_sheet, "'!$",
-        col_letter,
-        "$1:$",
-        col_letter,
-        "$",
-        n_choices
-      )
-
-      dataValidation(wb, sheet_name, col = 16, rows = uuids + 1, type = "list", value = values)
-      dataValidation(wb, sheet_name, col = 17, rows = uuids + 1, type = "list", value = values)
-      dataValidation(wb, sheet_name, col = 18, rows = uuids + 1, type = "list", value = values)
+      target_rows <- which(list_name_raw == list_name) + 1  # +1 pour la ligne d'en-tete
+      queue_list_validation(sheet_name, col = new_value_choice_col, rows = target_rows,
+                            list_range = list_values)
     }
   }
 
-  # validation Oui / Non (colonne de reserve)
-  yes_col <- nrow(other_db) + 2
-  writeData(wb, dropdown_sheet, "Oui", startCol = yes_col)
+  # Excel ne sait pas verrouiller/deverrouiller une cellule DYNAMIQUEMENT selon la valeur d'une autre
+  # sans macro VBA (voir commentaire sur OTHER_HEADERS_FR plus haut) : mise en forme conditionnelle a la
+  # place, qui grise (fond + police) la colonne "texte libre" tant que l'action n'est PAS "Reecrire", et
+  # la colonne "choix existant" tant que l'action n'est PAS "Reattribuer..." - y compris quand "Que
+  # faire ?" est encore vide (les deux colonnes apparaissent grisees par defaut avant tout choix). Dans
+  # les deux cas la cellule reste techniquement modifiable : un dxf (mise en forme conditionnelle OOXML)
+  # ne peut de toute facon porter aucun attribut de protection/verrouillage, ce n'est donc qu'un repere
+  # visuel de laquelle remplir, jamais un veritable verrou.
+  if (length(data_rows) > 0) {
+    action_col_letter <- openxlsx::int2col(action_col)
+    anchor_row <- data_rows[1]
+    rewrite_label <- unname(OTHER_ACTION_LABELS_FR[["rewrite"]])
+    reassign_label <- unname(OTHER_ACTION_LABELS_FR[["reassign"]])
+    grey_out_style <- createStyle(fgFill = "#D9D9D9", fontColour = "#A6A6A6")
 
-  yes_letter <- get_column_letter(yes_col)
-  yes_values <- paste0("'", dropdown_sheet, "'!$", yes_letter, "$1:$", yes_letter, "$1")
+    openxlsx::conditionalFormatting(wb, sheet_name, cols = new_value_text_col, rows = data_rows,
+                          rule = paste0("$", action_col_letter, anchor_row, '<>"', rewrite_label, '"'),
+                          style = grey_out_style, type = "expression")
+    openxlsx::conditionalFormatting(wb, sheet_name, cols = new_value_choice_col, rows = data_rows,
+                          rule = paste0("$", action_col_letter, anchor_row, '<>"', reassign_label, '"'),
+                          style = grey_out_style, type = "expression")
+  }
 
-  dataValidation(
-    wb, sheet_name,
-    col = 19,
-    rows = 2:(nrow(df) + 1),
-    type = "list",
-    value = yes_values
-  )
+  setColWidths(wb, sheet_name, cols = 1:ncol(df_display),
+              widths = c(22, 30, 18, 16, 14, 16, 20, 18, 22, 26, 44, 30, 34, 16, 22, 38, 34))
+  setRowHeights(wb, sheet_name, rows = 1, heights = 40)
 
-  # definir les largeurs de colonnes
-  setColWidths(wb, sheet_name, cols = 1:10, widths = 15)
-
-  setColWidths(wb, sheet_name, cols = 11:12, widths = 19)
-  setColWidths(wb, sheet_name, cols = 12:18, widths = 30)
-
-  # appliquer l'alignement et le retour a la ligne du texte
-  addStyle(wb, sheet_name, style = createStyle(valign = "top"), rows = 1:(nrow(df) + 1), cols = 1)
-  addStyle(wb, sheet_name, style = createStyle(valign = "top"), rows = 1:(nrow(df) + 1), cols = 2)
-  addStyle(wb, sheet_name, style = createStyle(valign = "top"), rows = 1:(nrow(df) + 1), cols = 3)
-  addStyle(wb, sheet_name, style = createStyle(valign = "top"), rows = 1:(nrow(df) + 1), cols = 4)
-  addStyle(wb, sheet_name, style = createStyle(valign = "top"), rows = 1:(nrow(df) + 1), cols = 5)
-  addStyle(wb, sheet_name, style = createStyle(valign = "top"), rows = 1:(nrow(df) + 1), cols = 6)
-  addStyle(wb, sheet_name, style = createStyle(wrapText = T, valign = "top"), rows = 1:(nrow(df) + 1), cols = 7)
-  addStyle(wb, sheet_name, style = createStyle(wrapText = T, valign = "top"), rows = 1:(nrow(df) + 1), cols = 8)
-  addStyle(wb, sheet_name, style = createStyle(wrapText = T, valign = "top"), rows = 1:(nrow(df) + 1), cols = 9)
-  addStyle(wb, sheet_name, style = createStyle(wrapText = T, valign = "top"), rows = 1:(nrow(df) + 1), cols = 10)
-
-  setRowHeights(wb, sheet_name, rows = 1, heights = 15)
-
-  # premiere ligne en gras
-  addStyle(wb, sheet_name, style = createStyle(textDecoration = "bold"), rows = 1, cols = 1:ncol(df))
-  addStyle(wb, sheet_name, style = style.col.color.first, rows = 1, cols = 1:18)
-
-  modifyBaseFont(wb, fontSize = 10, fontColour = "black", fontName = "Calibri")
-
-  # protection de la feuille (meme logique que write_review_sheet()/A_verifier) : la ligne d'en-tete et
-  # les colonnes techniques (uuid, type_question, liste_choix, nom_question, libelle_complet, reponse,
-  # choix_selectionnes, ...) restent verrouillees (locked = TRUE par defaut, aucune des cellules
-  # ci-dessus n'a ete deverrouillee). Seules les colonnes que l'equipe de suivi doit remplir sont
-  # deverrouillees ci-dessous - stack = TRUE pour AJOUTER locked = FALSE aux styles deja appliques
-  # (couleurs/bordures) plutot que de les remplacer.
-  editable_labels <- c(
-    "VRAI autre (copier la reponse ou fournir une meilleure traduction)",
-    "EXISTANT autre 1 (choisir la reponse la plus appropriee)",
-    "EXISTANT autre 2 (choisir la reponse la plus appropriee)",
-    "EXISTANT autre 3 (choisir la reponse la plus appropriee)",
-    "INVALIDE autre (selectionner oui ou laisser vide)",
-    "Message de SUIVI (qu'est-ce qui n'est pas clair dans cette reponse ?)",
-    "Explication"
-  )
-  editable_cols <- match(editable_labels, colnames(df_display))
-  editable_cols <- editable_cols[!is.na(editable_cols)]
-  addStyle(wb, sheet_name, style = createStyle(locked = FALSE), rows = 2:(nrow(df) + 1),
-          cols = editable_cols, gridExpand = TRUE, stack = TRUE)
-
-  # aucun mot de passe defini - protection uniquement contre les modifications accidentelles (voir
-  # write_review_sheet()), pas une mesure de securite.
+  # protection de la feuille : ligne d'en-tete et colonnes techniques verrouillees, "Que faire ?" et les
+  # deux colonnes "Nouvelle reponse" deverrouillees ci-dessus - meme logique que write_review_sheet()/
+  # A_verifier. Aucun mot de passe defini : protection uniquement contre les modifications accidentelles.
   protectWorksheet(wb, sheet_name, protect = TRUE)
 
   invisible(wb)
@@ -635,8 +784,16 @@ add_other_responses_sheet <- function(wb, df, sheet_name = "reponses_autres") {
 # B). Un seul tableau au lieu de plusieurs, en langage simple, avec le nom de variable Kobo technique
 # et l'identifiant d'enquete presents mais clairement marques "ne pas modifier" (necessaires pour
 # reappliquer les corrections automatiquement, mais ce ne sont pas les colonnes que l'equipe doit lire).
+# row_id/statut : voir carry_forward_decisions() plus bas - row_id est un identifiant STABLE d'une
+# ligne (uuid + variable + type de verification), le meme d'une execution a l'autre du pipeline tant que
+# les donnees a l'origine de la ligne n'ont pas change ; statut indique si la ligne reprend deja une
+# decision d'un classeur "suivi a verifier" precedent (voir Etape 1 du tableau de bord) ou si elle est
+# nouvelle. Les deux sont des colonnes techniques (ne pas modifier), jamais utilisees pour decider quoi
+# que ce soit cote equipe de suivi - uniquement pour permettre au pipeline de se souvenir du travail deja
+# fait la prochaine fois qu'il tourne sur des donnees qui se sont agrandies.
 REVIEW_HEADERS_FR <- c(
   uuid = "Identifiant enquete (ne pas modifier)",
+  row_id = "ID (ne pas modifier)",
   commune = "Commune",
   partenaire = "Partenaire",
   date = "Date",
@@ -646,8 +803,9 @@ REVIEW_HEADERS_FR <- c(
   question_label = "Question",
   reponse_actuelle = "Reponse actuelle",
   probleme = "Probleme detecte",
+  statut = "Statut (ne pas modifier)",
   action = "Que faire ? (obligatoire)",
-  nouvelle_reponse = "Nouvelle reponse (si 'Corriger la reponse')",
+  nouvelle_reponse = "Nouvelle reponse (si 'Corriger la reponse') - si plusieurs choix, separer par ;",
   # ce commentaire est aussi repris comme raison de suppression dans le classeur final (deletion_log)
   # quand "Que faire ?" = "Supprimer toute l'enquete" - voir deletion_log_final dans 2_nettoyage_final.R
   commentaire = "Commentaire (raison de suppression si l'enquete entiere est supprimee)"
@@ -669,29 +827,232 @@ ACTION_LABELS_FR <- c(
 # <article>_price_item, qui n'ont pas de libelle puisqu'ils ne sont jamais poses directement) - toujours
 # quelque chose de lisible plutot que de faire echouer l'export.
 get_question_label <- function(question){
-  if (is.na(question)) return("Toute l'enquete")
+  # length(question) == 0 (pas seulement NA) : cas reel quand all_issues a 0 ligne (aucun probleme
+  # detecte du tout - jeu de donnees parfaitement propre) - rowwise()/mutate() sur un tibble a 0 ligne
+  # appelle quand meme cette fonction une fois avec question = character(0) pour deduire le type de
+  # colonne resultat, et if(is.na(character(0))) leve "argument is of length zero" sans ce garde-fou.
+  if (length(question) == 0 || is.na(question)) return("Toute l'enquete")
   lbl <- kobo_survey$`label::french`[kobo_survey$name == question]
   lbl <- lbl[!is.na(lbl) & nzchar(lbl)]
   if (length(lbl) > 0) return(lbl[1])
   str_replace_all(question, "_", " ")
 }
 
+# Resout une variable technique (nom direct, ou colonne indicatrice binaire "question/choix" pour les
+# select_multiple) vers son q_type et sa liste de choix kobo - utilise pour proposer une liste
+# deroulante des choix valides dans la colonne "Nouvelle reponse" (voir write_review_sheet()) plutot
+# que du texte libre. Renvoie NULL si la variable n'est pas une question a choix (ou n'existe pas dans
+# l'outil), auquel cas la cellule reste en texte libre.
+get_variable_choice_list <- function(variable) {
+  if (length(variable) == 0 || is.na(variable) || !nzchar(variable)) return(NULL)
+  base_name <- if (variable %in% kobo_survey$name) variable else str_split(variable, "/")[[1]][1]
+  row <- kobo_survey[kobo_survey$name == base_name, ]
+  if (nrow(row) == 0 || !row$q_type[1] %in% c("select_one", "select_multiple")) return(NULL)
+  list(q_type = row$q_type[1], list_name = row$list_name[1])
+}
+
+# Retire les caracteres de controle bruts (hors tabulation/retour a la ligne/retour chariot) illegaux
+# dans le contenu XML (norme XML 1.0, production Char) - openxlsx ne les filtre/echappe pas de maniere
+# fiable avant ecriture (confirme empiriquement : un octet de controle isole comme 0x01, parfaitement
+# valide en UTF-8, est ecrit tel quel dans sharedStrings.xml) ce qui rend le classeur illisible pour
+# Excel ("reparation" au chargement, erreur XML generique du type "Line 1, column 0") alors
+# qu'openxlsx2::wb_load() ne detecte rien du tout (parseur plus permissif - pas fiable comme test de
+# validite ici, verifier plutot avec un parseur XML strict sur le fichier reellement sauvegarde). Ce
+# genre de caractere peut apparaitre dans n'importe quel champ texte libre issu de kobo (reponse,
+# commentaire...) ou tape par l'equipe de suivi en corrigeant le classeur - improbable mais jamais
+# totalement exclu vu la variete des claviers/telephones/copier-coller utilises sur le terrain.
+sanitize_xml_text <- function(x) {
+  if (!is.character(x)) return(x)
+  gsub("[\x01-\x08\x0b\x0c\x0e-\x1f]", "", x, perl = TRUE)
+}
+
+# Applique sanitize_xml_text() a toutes les colonnes texte d'un data.frame avant ecriture (write_*_sheet
+# ci-dessous) - les colonnes non-texte (numeriques, dates, facteurs...) traversent inchangees.
+sanitize_df_text <- function(df) {
+  df[] <- lapply(df, sanitize_xml_text)
+  df
+}
+
+# Feuille d'accueil du classeur "suivi a verifier" - un tableau "Onglet -> Quoi faire", une ligne par
+# onglet DANS LE MEME ORDRE que les onglets eux-memes (voir les noms numerotes SHEET_* dans
+# 2_nettoyage_final.R), pour que l'equipe de suivi sache en un coup d'oeil quoi faire dans chacun.
+# Toujours la 1ere feuille du classeur (appelee en 1er dans 2_nettoyage_final.R, avant les autres
+# addWorksheet() - openxlsx ordonne les feuilles selon l'ordre d'appel). Texte fixe (pas de donnees) :
+# autonome, n'utilise que openxlsx comme add_other_responses_sheet()/write_review_sheet() ci-dessous.
+write_suivi_intro_sheet <- function(wb, sheet_name = "1_Lisez_moi") {
+  addWorksheet(wb, sheet_name)
+
+  intro_text <- paste(
+    "Ce classeur reprend les enquetes signalees par la revue automatique du mois JMMI.",
+    "Certaines corrections evidentes (reponses \"RAS\"/\"rien a signaler\"/remerciements sans",
+    "information utile, reponse \"autre\" incoherente avec la question...) ont deja ete converties",
+    "en vide automatiquement - inutile d'y revenir.",
+    "Si la collecte est encore en cours et que ce classeur a ete regenere sur des donnees qui se sont",
+    "agrandies depuis une premiere revue : la colonne \"Statut\" indique \"Repris (deja traite)\" pour",
+    "les lignes qui reprennent automatiquement une decision deja prise precedemment (rien a refaire,",
+    "sauf pour changer d'avis), et \"Nouveau\" pour les lignes qui necessitent une premiere revue.",
+    "Les lignes deja tapees dans Journal_additionnel/Journal_suppression sont recopiees telles quelles",
+    "(pas de colonne \"Statut\" pour ces 2 onglets, saisis manuellement).",
+    "Une fois tous les onglets ci-dessous remplis, enregistrez ce classeur (meme nom) et",
+    "transmettez-le pour la construction du classeur final."
+  )
+
+  guide <- data.frame(
+    Onglet = c("2_Donnees_brutes", "3_A_verifier", "4_Verification_prix", "5_Reponses_autres",
+              "6_Journal_additionnel", "7_Journal_suppression"),
+    "Quoi faire" = c(
+      "Donnees brutes de reference (deja anonymisees, corrections automatiques deja appliquees) - pour retrouver le detail complet d'une enquete sans rouvrir l'export Kobo. Lecture seule.",
+      "Une ligne par probleme signale (valeur aberrante, incoherence logique, quasi-doublon...). Colonnes grisees = ne pas modifier. Pour chaque ligne, choisir une action dans \"Que faire ? (obligatoire)\" : Ne rien changer, Corriger la reponse (remplir alors \"Nouvelle reponse\"), Mettre une valeur manquante, ou Supprimer toute l'enquete.",
+      "Memes principes que 3_A_verifier, uniquement pour les prix des articles suivis. Les lignes d'un meme article (prix saisi(s) + unite standard + autre unite) sont regroupees visuellement (fond de couleur alterne, bordure) : elles forment UN SEUL bloc a traiter ensemble. Le prix final (et sa conversion en euros/dollars) est recalcule automatiquement une fois les corrections appliquees.",
+      "Reponses \"autre\" (texte libre) a reclasser. Pour chaque ligne, choisir une action dans \"Que faire ? (obligatoire)\" : Reecrire (taper le texte corrige/traduit dans \"Nouvelle reponse - texte libre\"), Reattribuer a un choix existant (choisir dans la liste deroulante \"Nouvelle reponse - choix existant\" ; si plusieurs choix sont necessaires a la fois, les taper plutot dans \"texte libre\", separes par ;), ou Supprimer (la reponse est mise a vide). Excel ne pouvant pas verrouiller une colonne selon l'action choisie, les deux colonnes \"Nouvelle reponse\" restent toujours modifiables mais celle qui ne correspond pas a l'action choisie apparait grisee - ne remplir que celle qui s'applique.",
+      "Pour ajouter une correction que la revue automatique n'a PAS signalee (absente de 3_A_verifier/4_Verification_prix) : une ligne par correction, avec l'identifiant d'enquete (uuid, voir 2_Donnees_brutes) et le nom technique de la variable concernee. change_type : change_response (remplir alors new_value), blank_response (mettre a vide), ou no_action.",
+      "Pour supprimer une enquete ENTIERE qui n'a pas ete signalee automatiquement : une ligne par enquete, avec l'identifiant d'enquete (uuid) et la raison de la suppression."
+    ),
+    check.names = FALSE, stringsAsFactors = FALSE
+  )
+
+  # banniere de titre (meme rouge que l'entete de 3_A_verifier/4_Verification_prix/5_Reponses_autres)
+  writeData(wb, sheet_name, "Comment remplir ce classeur", startRow = 1, startCol = 1, colNames = FALSE)
+  mergeCells(wb, sheet_name, cols = 1:2, rows = 1)
+  addStyle(wb, sheet_name, style = createStyle(fgFill = RED_HEADER, fontColour = "#FFFFFF",
+                                               textDecoration = "bold", fontSize = 16, valign = "center",
+                                               halign = "left"), rows = 1, cols = 1:2)
+  setRowHeights(wb, sheet_name, rows = 1, heights = 30)
+
+  writeData(wb, sheet_name, intro_text, startRow = 2, startCol = 1, colNames = FALSE)
+  mergeCells(wb, sheet_name, cols = 1:2, rows = 2)
+  addStyle(wb, sheet_name, style = createStyle(wrapText = TRUE, valign = "top"), rows = 2, cols = 1)
+  # hauteur calculee comme pour le tableau "guide" plus bas (~130 caracteres de large une fois les
+  # colonnes 1+2 fusionnees, ~16 unites de hauteur par ligne enveloppee) plutot que fixe - un texte
+  # d'introduction plus long (ex. ajout d'un paragraphe) ne doit pas se retrouver tronque a l'ouverture.
+  setRowHeights(wb, sheet_name, rows = 2, heights = max(62, ceiling(nchar(intro_text) / 130) * 16))
+
+  table_row1 <- 4
+  writeData(wb, sheet_name, guide, startRow = table_row1, colNames = TRUE)
+  addStyle(wb, sheet_name, style = createStyle(fgFill = GREY_HEADER, textDecoration = "bold",
+                                               valign = "center"), rows = table_row1, cols = 1:2)
+  data_rows <- (table_row1 + 1):(table_row1 + nrow(guide))
+  addStyle(wb, sheet_name, style = createStyle(wrapText = TRUE, valign = "top", textDecoration = "bold"),
+          rows = data_rows, cols = 1)
+  addStyle(wb, sheet_name, style = createStyle(wrapText = TRUE, valign = "top"), rows = data_rows, cols = 2)
+
+  # hauteur de ligne calculee (colonne "Quoi faire" de ~95 caracteres de large, ~16 unites de hauteur
+  # par ligne de texte enveloppee) plutot que laissee a la hauteur par defaut : sans cela, un paragraphe
+  # qui s'enveloppe sur plusieurs lignes apparait tronque a l'ouverture (Excel ne recalcule pas toujours
+  # la hauteur des lignes generees par openxlsx) tant que l'utilisateur ne double-clique pas la bordure
+  # de la ligne pour l'ajuster manuellement.
+  for (i in seq_len(nrow(guide))) {
+    n_wrapped_lines <- ceiling(nchar(guide[["Quoi faire"]][i]) / 95)
+    setRowHeights(wb, sheet_name, rows = table_row1 + i, heights = max(20, n_wrapped_lines * 16))
+  }
+
+  setColWidths(wb, sheet_name, cols = 1, widths = 26)
+  setColWidths(wb, sheet_name, cols = 2, widths = 110)
+  freezePane(wb, sheet_name, firstActiveRow = table_row1 + 1)
+
+  invisible(wb)
+}
+
+# Integre le journal de nettoyage additionnel DIRECTEMENT dans le classeur "suivi a verifier" (2
+# onglets : "Journal_additionnel" pour des corrections champ par champ non signalees par la revue
+# automatique, "Journal_suppression" pour supprimer des enquetes entieres) - remplace l'ancien modele
+# telecharge separement (voir prepare_additional_cleaning_log()/prepare_additional_deletion_log(), qui
+# lisent desormais ces onglets PAR NOM directement dans le classeur rempli, plutot qu'un fichier a part).
+# Pas de feuille "raw_data" dupliquee ici (contrairement a l'ancien modele) : la feuille "raw_data" du
+# classeur "suivi a verifier" lui-meme (voir 2_nettoyage_final.R) sert deja de reference, avec les
+# corrections automatiques (RAS, reponses sans information utile...) deja appliquees.
+ADDITIONAL_LOG_HEADERS <- c("uuid", "variable", "issue", "feedback", "change_type", "old_value", "new_value")
+ADDITIONAL_LOG_CHANGE_TYPES <- c("change_response", "blank_response", "no_action", "remove_survey")
+DELETION_LOG_HEADERS <- c("uuid", "reason_deletion")
+
+# previous_additional/previous_deletion : lignes DEJA TAPEES dans le classeur "suivi a verifier"
+# precedent (voir previous_review_path/carry_forward_decisions() dans 2_nettoyage_final.R), a
+# recopier telles quelles dans le nouveau classeur. Contrairement a "A_verifier"/"Verification_prix"/
+# "Reponses_autres" (regenerees automatiquement a chaque execution, avec un row_id pour faire
+# correspondre une ligne fraiche a une decision precedente), ces 2 feuilles sont a saisie 100% manuelle
+# et ne sont jamais regenerees - "reprendre" une ligne precedente n'a donc pas de sens a faire
+# correspondre par identifiant, juste a recopier ce qui a deja ete tape, pour eviter de tout retaper
+# quand la collecte se poursuit et que le classeur est regenere sur des donnees agrandies. Data frame
+# avec les colonnes de ADDITIONAL_LOG_HEADERS/DELETION_LOG_HEADERS (dans n'importe quel ordre - reordonne
+# ci-dessous), ou NULL si aucune ligne a reprendre.
+add_additional_log_sheets <- function(wb, sheet_name = "6_Journal_additionnel", sheet_name2 = "7_Journal_suppression",
+                                      previous_additional = NULL, previous_deletion = NULL) {
+  sheet <- sheet_name
+  addWorksheet(wb, sheet)
+  writeData(wb, sheet, as.list(ADDITIONAL_LOG_HEADERS), startRow = 1, colNames = FALSE)
+  if (!is.null(previous_additional) && nrow(previous_additional) > 0) {
+    writeData(wb, sheet, previous_additional[, ADDITIONAL_LOG_HEADERS, drop = FALSE], startRow = 2, colNames = FALSE)
+  }
+  addStyle(wb, sheet, style = createStyle(textDecoration = "bold", fgFill = GREY_HEADER),
+          rows = 1, cols = seq_along(ADDITIONAL_LOG_HEADERS))
+  freezePane(wb, sheet, firstActiveRow = 2)
+  addFilter(wb, sheet, rows = 1, cols = seq_along(ADDITIONAL_LOG_HEADERS))
+  setColWidths(wb, sheet, cols = seq_along(ADDITIONAL_LOG_HEADERS), widths = c(24, 22, 30, 30, 16, 20, 20))
+
+  # zone de saisie deverrouillee genereuse (1000 lignes) - au-dela, les cellules resteraient
+  # verrouillees par defaut (comportement standard Excel sur une feuille protegee)
+  addStyle(wb, sheet, style = createStyle(locked = FALSE), rows = 2:1000,
+          cols = seq_along(ADDITIONAL_LOG_HEADERS), gridExpand = TRUE)
+  change_type_col <- which(ADDITIONAL_LOG_HEADERS == "change_type")
+  # liste litterale en ligne (pas de sqref sur plage multi-cellules), donc pas concernee par la
+  # contrainte "sqref = xsd:list separe par des espaces, pas des virgules" de queue_list_validation() -
+  # voir la note associee dans ce fichier.
+  queue_list_validation(sheet, col = change_type_col, rows = 2:1000,
+                        list_range = paste0('"', paste(ADDITIONAL_LOG_CHANGE_TYPES, collapse = ","), '"'))
+
+  protectWorksheet(wb, sheet, protect = TRUE)
+
+  sheet2 <- sheet_name2
+  addWorksheet(wb, sheet2)
+  writeData(wb, sheet2, as.list(DELETION_LOG_HEADERS), startRow = 1, colNames = FALSE)
+  if (!is.null(previous_deletion) && nrow(previous_deletion) > 0) {
+    writeData(wb, sheet2, previous_deletion[, DELETION_LOG_HEADERS, drop = FALSE], startRow = 2, colNames = FALSE)
+  }
+  addStyle(wb, sheet2, style = createStyle(textDecoration = "bold", fgFill = GREY_HEADER),
+          rows = 1, cols = seq_along(DELETION_LOG_HEADERS))
+  freezePane(wb, sheet2, firstActiveRow = 2)
+  addFilter(wb, sheet2, rows = 1, cols = seq_along(DELETION_LOG_HEADERS))
+  setColWidths(wb, sheet2, cols = seq_along(DELETION_LOG_HEADERS), widths = c(24, 40))
+  addStyle(wb, sheet2, style = createStyle(locked = FALSE), rows = 2:1000,
+          cols = seq_along(DELETION_LOG_HEADERS), gridExpand = TRUE)
+  protectWorksheet(wb, sheet2, protect = TRUE)
+
+  invisible(wb)
+}
+
 # Ecrit la feuille de verification consolidee dans un classeur existant (meme logique que
 # add_other_responses_sheet() : l'appelant cree/charge `wb` et sauvegarde une fois toutes les feuilles
 # ajoutees). `df` doit avoir les colonnes techniques de REVIEW_HEADERS_FR ; "action" peut etre vide (a
 # remplir par l'equipe) ou deja une valeur de ACTION_LABELS_FR.
-write_review_sheet <- function(wb, df, sheet_name = "A_verifier") {
+write_review_sheet <- function(wb, df, sheet_name = "3_A_verifier") {
+  # bloc de variables liees (prix + contexte d'un meme article - voir item_blocks/expand_price_item_row
+  # dans 2_nettoyage_final.R) - extrait AVANT le select() ci-dessous, puisque block_id n'est pas une des
+  # colonnes de REVIEW_HEADERS_FR (donc jamais affichee comme colonne), seulement utilisee ici pour
+  # appliquer un bandeau de couleur alterne aux lignes d'un meme bloc (voir plus bas).
+  block_id <- if ("block_id" %in% colnames(df)) df$block_id else rep(NA_character_, nrow(df))
+
   df_display <- df %>% select(names(REVIEW_HEADERS_FR))
   colnames(df_display) <- unname(REVIEW_HEADERS_FR[colnames(df_display)])
+  df_display <- sanitize_df_text(df_display)
 
   addWorksheet(wb, sheet_name)
   writeData(wb, sheet_name, df_display, colNames = TRUE)
 
   n <- nrow(df_display) + 1
+  # 2:n vaut c(2, 1) (sequence DESCENDANTE, pas une plage vide) quand n == 1, c'est-a-dire quand
+  # df_display a 0 ligne - cas reel (pas seulement theorique) d'un jeu de donnees sans aucun probleme
+  # detecte. Sans ce garde-fou, les styles/validations "lignes de donnees" ci-dessous retoucheraient
+  # aussi la ligne d'en-tete (ligne 1), la deverrouillant notamment via le style locked = FALSE plus bas.
+  data_rows <- if (n >= 2) 2:n else integer(0)
   col_of_display <- function(key) match(REVIEW_HEADERS_FR[[key]], colnames(df_display))
   action_col <- col_of_display("action")
   uuid_col <- col_of_display("uuid")
   variable_col <- col_of_display("variable")
+  # colonnes techniques supplementaires (voir carry_forward_decisions()) - memes regles de grisage/
+  # verrouillage que uuid/variable ci-dessous, partout ou ces deux-la apparaissent.
+  row_id_col <- col_of_display("row_id")
+  statut_col <- col_of_display("statut")
+  technical_id_cols <- c(uuid_col, row_id_col, variable_col, statut_col)
 
   # en-tete : fond rouge, texte blanc, gras, figee, avec filtres
   addStyle(wb, sheet_name, style = createStyle(fgFill = RED_HEADER, fontColour = "#FFFFFF",
@@ -704,23 +1065,114 @@ write_review_sheet <- function(wb, df, sheet_name = "A_verifier") {
   # texte avec retour a la ligne pour toutes les colonnes de contenu - deverrouillees (locked = FALSE)
   # puisque ce sont les cellules que l'equipe de suivi doit remplir (voir protectWorksheet() ci-dessous)
   addStyle(wb, sheet_name, style = createStyle(wrapText = TRUE, valign = "top", locked = FALSE),
-           rows = 2:n, cols = 1:ncol(df_display), gridExpand = TRUE)
+           rows = data_rows, cols = 1:ncol(df_display), gridExpand = TRUE)
 
   # colonnes techniques (a ne pas modifier) : fond gris pour bien les distinguer des colonnes a remplir,
   # et verrouillees (locked = TRUE, explicite car addStyle() remplace entierement le style precedent sur
   # ces memes cellules - sans cela elles resteraient deverrouillees par le style ci-dessus)
   addStyle(wb, sheet_name, style = createStyle(fgFill = GREY_HEADER, fontColour = "#595959", wrapText = TRUE,
                                                valign = "top", locked = TRUE),
-           rows = 2:n, cols = c(uuid_col, variable_col), gridExpand = TRUE)
+           rows = data_rows, cols = technical_id_cols, gridExpand = TRUE)
+
+  # alternance de fond gris TRES clair / gris clair PAR BLOC + bordure MOYENNE autour du perimetre de
+  # chaque bloc de lignes liees (prix + std/other d'un meme article - voir expand_price_item_row() dans
+  # 2_nettoyage_final.R) : les deux se combinent (le fond fait percevoir le bloc comme une bande
+  # continue, la bordure en marque nettement la limite - demande explicite de l'utilisateur de garder
+  # les deux, pas de remplacer l'un par l'autre). Chaque appel definit un style COMPLET (fond +
+  # police/verrouillage + bordure eventuelle) en une seule fois plutot que d'accumuler plusieurs
+  # bordures avec stack = TRUE sur les memes cellules. Le fond est d'abord pose sur tout le rectangle du
+  # bloc (sans bordure), puis les 4 appels perimetre (gauche/droite/haut/bas, MEME fond) l'ecrasent
+  # uniquement sur leur cote - les 2 derniers ("haut"/"bas", pleine largeur) ecrasent volontairement les
+  # coins deja touches par "gauche"/"droite" : le cadre n'est donc pas ferme au pixel pres aux 4 coins,
+  # mais reste tres lisible (lignes horizontales continues sur toute la largeur du bloc).
+  BLOCK_SHADE_LIGHT <- "#F2F2F2"
+  BLOCK_SHADE_MED <- "#E3E3E3"
+  if (any(!is.na(block_id))) {
+    blocks_rle <- rle(block_id)
+    block_end_idx <- cumsum(blocks_rle$lengths)
+    block_start_idx <- block_end_idx - blocks_rle$lengths + 1
+    shade_idx <- 0
+    apply_block_style <- function(rows_range, cols_range, shade, border_side = NULL) {
+      grey_cols <- intersect(cols_range, technical_id_cols)
+      content_cols <- setdiff(cols_range, grey_cols)
+      border_args <- if (is.null(border_side)) list() else list(border = border_side, borderStyle = "medium")
+      if (length(grey_cols) > 0) {
+        addStyle(wb, sheet_name,
+                style = do.call(createStyle, c(list(fgFill = shade, fontColour = "#595959", wrapText = TRUE,
+                                                    valign = "top", locked = TRUE), border_args)),
+                rows = rows_range, cols = grey_cols, gridExpand = TRUE)
+      }
+      if (length(content_cols) > 0) {
+        addStyle(wb, sheet_name,
+                style = do.call(createStyle, c(list(fgFill = shade, wrapText = TRUE, valign = "top",
+                                                    locked = FALSE), border_args)),
+                rows = rows_range, cols = content_cols, gridExpand = TRUE)
+      }
+    }
+    for (b in seq_along(blocks_rle$values)) {
+      if (is.na(blocks_rle$values[b])) next
+      shade_idx <- shade_idx + 1
+      shade <- if (shade_idx %% 2 == 1) BLOCK_SHADE_LIGHT else BLOCK_SHADE_MED
+      r1 <- block_start_idx[b] + 1  # +1 pour la ligne d'en-tete
+      r2 <- block_end_idx[b] + 1
+      all_cols <- 1:ncol(df_display)
+      apply_block_style(r1:r2, all_cols, shade)
+      apply_block_style(r1:r2, 1, shade, "left")
+      apply_block_style(r1:r2, ncol(df_display), shade, "right")
+      apply_block_style(r1, all_cols, shade, "top")
+      apply_block_style(r2, all_cols, shade, "bottom")
+    }
+  }
 
   # liste deroulante pour la colonne "Que faire ?" - liste en ligne (pas besoin d'une feuille annexe,
   # les 4 options tiennent largement dans la limite de 255 caracteres d'Excel)
   action_choices <- paste0('"', paste(unname(ACTION_LABELS_FR), collapse = ","), '"')
-  dataValidation(wb, sheet_name, col = action_col, rows = 2:n, type = "list", value = action_choices)
+  queue_list_validation(sheet_name, col = action_col, rows = data_rows, list_range = action_choices)
 
+  # liste deroulante pour "Nouvelle reponse" quand la variable signalee est une question a choix
+  # (select_one/select_multiple) : chaque ligne obtient la liste des choix VALIDES DE SA PROPRE
+  # question, pour eviter que l'equipe tape un libelle qui ne correspondra a aucun code une fois
+  # retraduit (voir read_review_sheet()). Les libelles sont stockes dans une feuille cachee (une
+  # colonne par liste de choix kobo referencee, partagee entre les questions qui utilisent la meme
+  # liste) - meme principe que la feuille "Listes_..." de add_other_responses_sheet(). Pour les
+  # select_multiple, si plusieurs choix sont necessaires, l'equipe peut les separer par ";" (voir
+  # read_review_sheet()) - la liste deroulante n'insere qu'un seul choix a la fois (limitation Excel).
+  nouvelle_reponse_col <- col_of_display("nouvelle_reponse")
+  choice_lists_sheet <- substr(paste0("Listes_", sheet_name), 1, 31)
+  addWorksheet(wb, choice_lists_sheet, visible = FALSE)
+
+  if (length(data_rows) > 0) {
+    variable_lists <- vapply(df$variable, function(v) {
+      info <- get_variable_choice_list(v)
+      if (is.null(info)) NA_character_ else info$list_name
+    }, character(1))
+
+    unique_lists <- unique(variable_lists[!is.na(variable_lists)])
+    for (li in seq_along(unique_lists)) {
+      list_name <- unique_lists[li]
+      choice_labels <- kobo_choices$label[kobo_choices$list_name == list_name]
+      choice_labels <- choice_labels[!is.na(choice_labels) & nzchar(choice_labels)]
+      if (length(choice_labels) == 0) next
+
+      writeData(wb, choice_lists_sheet, choice_labels, startCol = li)
+      col_letter <- openxlsx::int2col(li)
+      list_values <- paste0("'", choice_lists_sheet, "'!$", col_letter, "$1:$", col_letter,
+                            "$", length(choice_labels))
+
+      target_rows <- which(variable_lists == list_name) + 1  # +1 pour la ligne d'en-tete
+      queue_list_validation(sheet_name, col = nouvelle_reponse_col, rows = target_rows,
+                            list_range = list_values)
+    }
+  }
+
+  # colonnes elargies (notamment "Nouvelle reponse", au libelle tres long) pour que le texte de l'entete
+  # tienne sur moins de lignes une fois enveloppe - permet en retour une hauteur de ligne d'en-tete plus
+  # raisonnable juste en dessous (demande utilisateur : entete auparavant beaucoup trop haute). "Question"
+  # (8eme colonne, le libelle complet de la question kobo) elargie a son tour (demande utilisateur : les
+  # lignes de donnees etaient trop hautes, ce texte s'enveloppant sur de nombreuses lignes courtes).
   setColWidths(wb, sheet_name, cols = 1:ncol(df_display),
-              widths = c(20, 14, 16, 14, 14, 18, 26, 30, 20, 32, 24, 26, 40))
-  setRowHeights(wb, sheet_name, rows = 1, heights = 32)
+              widths = c(22, 30, 16, 18, 16, 16, 20, 28, 55, 22, 34, 16, 28, 38, 44))
+  setRowHeights(wb, sheet_name, rows = 1, heights = 26)
 
   # protection de la feuille : empeche de modifier l'en-tete (ligne 1, verrouillee par defaut) et les
   # colonnes techniques "ne pas modifier" (uuid/variable, verrouillees ci-dessus), tout en laissant les
@@ -737,17 +1189,329 @@ write_review_sheet <- function(wb, df, sheet_name = "A_verifier") {
 # cleaningtools (create_clean_data(), review_cleaning_log(), ...) - meme logique de "traduction a la
 # frontiere" que pour la feuille reponses_autres : l'equipe ne voit jamais ces noms techniques, seul ce
 # point de lecture les reintroduit.
-read_review_sheet <- function(path, sheet_name = "A_verifier") {
+
+# Retraduit le contenu de "Nouvelle reponse" (voir la liste deroulante ajoutee par write_review_sheet())
+# du libelle kobo choisi par l'equipe vers le code technique attendu par cleaningtools -
+# correspondance exacte en priorite (cas le plus courant : un seul libelle choisi dans la liste
+# deroulante) ; pour les select_multiple, repli sur un decoupage par ";" (et non par espace : les
+# libelles eux-memes contiennent des espaces) si l'equipe a combine plusieurs choix dans la meme
+# cellule. Toute portion qui ne correspond a aucun libelle connu est conservee telle quelle (deja un
+# code valide, ou texte libre) plutot que rejetee.
+choice_translate <- function(variable, value) {
+  if (length(value) == 0) return(NA_character_)
+  if (is.na(value) || !nzchar(value)) return(value)
+  info <- get_variable_choice_list(variable)
+  if (is.null(info)) return(value)
+
+  choices <- kobo_choices[kobo_choices$list_name == info$list_name, ]
+  exact <- choices$name[choices$label == value]
+  if (length(exact) > 0) return(exact[1])
+
+  if (info$q_type == "select_multiple" && grepl(";", value, fixed = TRUE)) {
+    parts <- trimws(str_split(value, ";")[[1]])
+    parts <- parts[nzchar(parts)]
+    codes <- vapply(parts, function(p) {
+      m <- choices$name[choices$label == p]
+      if (length(m) > 0) m[1] else p
+    }, character(1))
+    return(paste(codes, collapse = " "))
+  }
+
+  value
+}
+
+# translate_choices = FALSE : ne retraduit PAS "nouvelle_reponse" (libelle choisi -> code kobo) - utilise
+# par carry_forward_decisions() (voir plus bas) quand on relit un classeur PRECEDENT pour en reprendre
+# les decisions dans un classeur fraichement regenere : on veut alors reinjecter exactement le libelle
+# francais tel que l'equipe l'avait choisi (ce que write_review_sheet() reecrira tel quel dans la
+# cellule), pas le code technique cleaningtools - qui, lui, resterait correct pour create_clean_data()
+# mais s'afficherait tel quel (illisible) si jamais reaffiche dans une cellule "Nouvelle reponse".
+read_review_sheet <- function(path, sheet_name = "3_A_verifier", translate_choices = TRUE) {
   raw <- read_excel(path, sheet = sheet_name, col_types = "text")
   header_rev <- setNames(names(REVIEW_HEADERS_FR), unname(REVIEW_HEADERS_FR))
   match_idx <- match(colnames(raw), names(header_rev))
   colnames(raw)[!is.na(match_idx)] <- header_rev[match_idx[!is.na(match_idx)]]
 
   action_rev <- setNames(names(ACTION_LABELS_FR), unname(ACTION_LABELS_FR))
+  raw <- raw %>% mutate(change_type = unname(action_rev[action]))
+
+  # une valeur de "Que faire ?" non reconnue (faute de frappe, texte tape au lieu de choisi dans la
+  # liste deroulante, ...) donnerait un change_type NA silencieux sans ce garde-fou - la ligne serait
+  # ensuite ignoree plus loin dans le pipeline sans que personne ne s'en apercoive.
+  invalid_action <- raw %>% filter(!is.na(action) & nzchar(action) & is.na(change_type))
+  if (nrow(invalid_action) > 0) {
+    detail <- paste0("uuid=", invalid_action$uuid, ", variable=", invalid_action$variable,
+                     " : valeur '", invalid_action$action, "' non reconnue pour \"Que faire ?\"")
+    stop("Valeur(s) invalide(s) dans la colonne \"Que faire ?\" du classeur suivi a verifier (feuille '",
+        sheet_name, "', fichier ", basename(path), ") - utilisez uniquement les options de la liste ",
+        "deroulante ('",
+        paste(unname(ACTION_LABELS_FR), collapse = "', '"), "') :\n- ", paste(detail, collapse = "\n- "))
+  }
+
+  if (translate_choices) {
+    raw <- raw %>%
+      rowwise() %>%
+      mutate(nouvelle_reponse = choice_translate(variable, nouvelle_reponse)) %>%
+      ungroup()
+  }
+
   raw %>%
-    mutate(change_type = unname(action_rev[action])) %>%
     rename(question = variable, old_value = reponse_actuelle, new_value = nouvelle_reponse,
           issue = probleme, comment = commentaire)
+}
+
+# Relit une feuille "Reponses_autres" remplie et la retraduit vers les noms techniques (memes noms que
+# df_other/OTHER_HEADERS_FR - pas de renommage supplementaire type read_review_sheet(), puisque
+# OTHER_HEADERS_FR utilise deja directement les noms internes comme cles). Utilisee a la fois par la
+# PASSE 2 (2_nettoyage_final.R) et par carry_forward_decisions() (voir plus bas) - un seul point de
+# traduction "francais affiche -> nom technique" pour cette feuille, au lieu de dupliquer la logique.
+read_other_responses_sheet <- function(path, sheet_name = "5_Reponses_autres") {
+  raw <- read_excel(path, sheet = sheet_name, col_types = "text")
+  header_en <- setNames(names(OTHER_HEADERS_FR), unname(OTHER_HEADERS_FR))
+  match_idx <- match(colnames(raw), names(header_en))
+  colnames(raw)[!is.na(match_idx)] <- header_en[match_idx[!is.na(match_idx)]]
+  raw
+}
+
+# Reprend les decisions (action + valeur(s) de remplacement) d'un classeur "suivi a verifier" PRECEDENT
+# dans les lignes fraichement regenerees pour l'execution en cours, ligne par ligne, par identifiant
+# stable (voir row_id, cree dans 2_nettoyage_final.R avant l'appel a write_review_sheet()/
+# add_other_responses_sheet()) - pour relancer le pipeline sur des donnees qui se sont AGRANDIES
+# (nouvelles soumissions Kobo) sans perdre le travail de revue deja fait sur les enquetes deja
+# presentes avant, ni devoir copier-coller a la main entre deux classeurs. Fonction generique (aucune
+# connaissance Excel/nom de feuille) - reutilisee pour "A_verifier", "Verification_prix" et
+# "Reponses_autres" depuis 2_nettoyage_final.R, avec des noms de colonnes differents a chaque fois.
+#
+# new_df        : lignes fraichement generees pour CETTE execution (row_id/statut deja presents,
+#                 colonnes de decision encore vides).
+# previous_df   : lignes du classeur precedent, DEJA retraduites en noms techniques identiques a ceux
+#                 de new_df (voir les appels dans 2_nettoyage_final.R) - peut contenir des lignes non
+#                 remplies (action encore vide), ignorees ci-dessous (rien a reprendre).
+# id_col        : colonne identifiant stable commune aux deux data frames ("row_id").
+# action_col    : colonne "Que faire ?" - une ligne du classeur precedent n'est reprise que si elle a
+#                 une valeur non vide ici.
+# carry_cols    : autres colonnes de decision a reprendre quand une correspondance valide est trouvee
+#                 (ex. "nouvelle_reponse"/"commentaire", ou "new_value_text"/"new_value_choice").
+# old_value_col : colonne de contexte a comparer avant de reprendre une decision (garde-fou : si la
+#                 valeur d'origine a change depuis le classeur precedent - ne devrait jamais arriver si
+#                 les anciennes donnees sont vraiment figees, mais peu couteux a verifier - la decision
+#                 n'est PAS reprise, la ligne reste vierge pour une revue fraiche plutot que d'appliquer
+#                 une decision sur des donnees perimees). NULL pour desactiver cette verification.
+carry_forward_decisions <- function(new_df, previous_df, id_col = "row_id", action_col = "action",
+                                    carry_cols = character(0), old_value_col = NULL,
+                                    statut_col = "statut") {
+  if (is.null(previous_df) || nrow(previous_df) == 0 || !id_col %in% colnames(previous_df)) {
+    return(new_df)
+  }
+
+  has_decision <- !is.na(previous_df[[action_col]]) & nzchar(previous_df[[action_col]])
+  previous_decided <- previous_df[has_decision, , drop = FALSE]
+  if (nrow(previous_decided) == 0) return(new_df)
+
+  # un row_id ne devrait apparaitre qu'une fois dans un classeur "suivi a verifier" normal - s'il y en a
+  # quand meme (ex. classeur precedent lui-meme issu d'une fusion de plusieurs fichiers), garder la
+  # PREMIERE decision rencontree pour chacun plutot que de faire planter toute la generation du
+  # classeur pour une anomalie mineure portant sur d'anciennes donnees.
+  dup_ids <- previous_decided[[id_col]][duplicated(previous_decided[[id_col]])]
+  if (length(dup_ids) > 0) {
+    warning("Classeur precedent : ", length(unique(dup_ids)), " identifiant(s) en double avec une ",
+           "decision remplie - seule la premiere decision rencontree est reprise pour chacun : ",
+           paste(unique(dup_ids), collapse = ", "))
+    previous_decided <- previous_decided[!duplicated(previous_decided[[id_col]]), , drop = FALSE]
+  }
+
+  match_idx <- match(new_df[[id_col]], previous_decided[[id_col]])
+  can_carry <- !is.na(match_idx)
+
+  if (!is.null(old_value_col) && old_value_col %in% colnames(new_df) &&
+      old_value_col %in% colnames(previous_decided)) {
+    # NA et "" traites comme EQUIVALENTS ("valeur absente") avant comparaison - sans cela, un champ
+    # legitimement vide des les deux executions (ex. "_other_unit_item" quand l'unite standard a ete
+    # utilisee, jamais rempli) casse silencieusement la reprise : construit fraichement, il vaut ""
+    # (voir expand_price_item_row() dans 2_nettoyage_final.R, qui convertit NA en "" explicitement) ;
+    # relu depuis le classeur precedent via read_review_sheet()/read_other_responses_sheet(), la MEME
+    # cellule vide revient en NA (openxlsx ecrit "" comme une cellule Excel vide, readxl relit une
+    # cellule vide en NA) - "" != NA (resultat NA en R, converti en FALSE juste apres) bloquait donc a
+    # tort la reprise, precisement pour les champs les plus souvent vides.
+    norm_empty <- function(x) ifelse(is.na(x) | !nzchar(x), "", x)
+    old_matches <- norm_empty(new_df[[old_value_col]]) == norm_empty(previous_decided[[old_value_col]][match_idx])
+    old_matches[is.na(old_matches)] <- FALSE
+    can_carry <- can_carry & old_matches
+  }
+
+  if (!any(can_carry)) return(new_df)
+
+  src_idx <- match_idx[can_carry]
+  new_df[[action_col]][can_carry] <- previous_decided[[action_col]][src_idx]
+  for (col in carry_cols) {
+    if (col %in% colnames(previous_decided)) {
+      new_df[[col]][can_carry] <- previous_decided[[col]][src_idx]
+    }
+  }
+  if (statut_col %in% colnames(new_df)) {
+    new_df[[statut_col]][can_carry] <- "Repris (deja traite)"
+  }
+  new_df
+}
+
+#############################################################################################################
+# JOURNAL DE NETTOYAGE ADDITIONNEL (optionnel - complement manuel au classeur "A_verifier")
+#############################################################################################################
+# ADDITIONAL_LOG_HEADERS/ADDITIONAL_LOG_CHANGE_TYPES definis plus haut, avec add_additional_log_sheets()
+# qui genere les onglets "Journal_additionnel"/"Journal_suppression" du classeur "suivi a verifier" -
+# memes noms de colonnes que la feuille cleaning_log du classeur final (voir build_final_workbook()).
+
+# Verifie chaque ligne du journal additionnel importe et construit un message d'erreur DETAILLE (numero
+# de ligne Excel, uuid, variable) pour CHAQUE probleme trouve, plutot que de laisser create_clean_data()
+# (cleaningtools) echouer plus loin avec un message generique qui ne dit pas quelle ligne du fichier
+# importe en est la cause. S'arrete (stop()) avec la liste complete des problemes si au moins un est
+# trouve, pour que l'utilisateur puisse tout corriger en une seule fois plutot que de re-importer a
+# repetition pour decouvrir les erreurs une par une.
+validate_additional_cleaning_log <- function(df, raw_data_all) {
+  missing_cols <- setdiff(ADDITIONAL_LOG_HEADERS, colnames(df))
+  if (length(missing_cols) > 0) {
+    stop("Le journal de nettoyage additionnel importe n'a pas les colonnes attendues (colonnes manquantes : ",
+        paste(missing_cols, collapse = ", "), ") - utilisez le modele telecharge depuis le tableau de bord, ",
+        "sans modifier l'en-tete.")
+  }
+
+  problems <- character(0)
+  for (i in seq_len(nrow(df))) {
+    excel_row <- i + 1  # +1 pour la ligne d'en-tete
+    uuid <- df$uuid[i]
+    variable <- df$variable[i]
+    change_type <- df$change_type[i]
+    new_value <- df$new_value[i]
+
+    ref <- paste0("Ligne ", excel_row, " (uuid=", ifelse(is.na(uuid) || !nzchar(uuid), "manquant", uuid),
+                 ", variable=", ifelse(is.na(variable) || !nzchar(variable), "manquant", variable), ")")
+
+    if (is.na(uuid) || !nzchar(uuid)) {
+      problems <- c(problems, paste0(ref, " : identifiant d'enquete (uuid) manquant."))
+      next
+    }
+    if (!uuid %in% raw_data_all$uuid) {
+      problems <- c(problems, paste0(ref, " : cet identifiant d'enquete n'existe pas dans les donnees brutes importees."))
+      next
+    }
+    if (is.na(change_type) || !change_type %in% ADDITIONAL_LOG_CHANGE_TYPES) {
+      problems <- c(problems, paste0(ref, " : 'change_type' doit etre l'une de ces valeurs : ",
+                                     paste(ADDITIONAL_LOG_CHANGE_TYPES, collapse = ", "), " (valeur trouvee : '",
+                                     ifelse(is.na(change_type), "vide", change_type), "')."))
+      next
+    }
+    if (change_type != "remove_survey") {
+      if (is.na(variable) || !nzchar(variable)) {
+        problems <- c(problems, paste0(ref, " : 'variable' est obligatoire sauf quand change_type = 'remove_survey'."))
+        next
+      }
+      if (!variable %in% colnames(raw_data_all)) {
+        problems <- c(problems, paste0(ref, " : la variable '", variable, "' n'existe pas dans les donnees brutes."))
+        next
+      }
+    }
+    if (change_type == "change_response" && (is.na(new_value) || !nzchar(new_value))) {
+      problems <- c(problems, paste0(ref, " : 'new_value' est obligatoire quand change_type = 'change_response'."))
+    }
+  }
+
+  if (length(problems) > 0) {
+    stop("Le journal de nettoyage additionnel contient des erreurs - a corriger avant de continuer :\n- ",
+        paste(problems, collapse = "\n- "))
+  }
+
+  invisible(TRUE)
+}
+
+# Lit, valide (voir validate_additional_cleaning_log()) et prepare le journal de nettoyage additionnel
+# pour etre concatene avec le classeur "A_verifier" rempli (voir 2_nettoyage_final.R, passe 2) - memes
+# noms de colonnes internes (question/comment) que read_review_sheet(), pour que tout le reste du
+# pipeline (filled_field_level, deletion_log, combined_cleaning_log, ...) le traite exactement comme des
+# lignes de plus du classeur rempli, sans logique dupliquee. Lu par NOM DE FEUILLE (pas par position :
+# "Journal_additionnel" est desormais un onglet DE PLUS du classeur "suivi a verifier" lui-meme - voir
+# add_additional_log_sheets() - plus un fichier separe ou il aurait ete la 1ere feuille). Renvoie NULL si
+# l'onglet est absent (classeur genere par une version anterieure du pipeline) ou vide (present mais non
+# rempli) - optionnel dans les deux cas, ce n'est pas une erreur.
+prepare_additional_cleaning_log <- function(path, raw_data_all) {
+  df <- tryCatch(read_excel(path, sheet = "6_Journal_additionnel", col_types = "text"),
+                error = function(e) NULL)
+  if (is.null(df)) return(NULL)
+  df <- df[rowSums(!is.na(df)) > 0, , drop = FALSE]
+  if (nrow(df) == 0) return(NULL)
+
+  validate_additional_cleaning_log(df, raw_data_all)
+
+  df %>%
+    rename(question = variable, comment = feedback) %>%
+    select(uuid, question, change_type, old_value, new_value, issue, comment)
+}
+
+#############################################################################################################
+# JOURNAL DE SUPPRESSION ADDITIONNEL (2eme onglet du meme classeur que le journal de nettoyage
+# additionnel - DELETION_LOG_HEADERS definie plus haut, voir add_additional_log_sheets()) - permet de
+# signaler des enquetes entieres a supprimer sans devoir remplir toutes les colonnes du journal de
+# nettoyage general (change_type=remove_survey, variable vide, etc.). Pas de colonne enum_id :
+# l'identifiant de l'enqueteur est de toute facon re-derive automatiquement dans le classeur final via
+# l'enum_lookup base sur les donnees brutes (voir deletion_log_final dans 2_nettoyage_final.R).
+#############################################################################################################
+
+# Meme logique que validate_additional_cleaning_log() : message d'erreur DETAILLE (numero de ligne
+# Excel, uuid) pour chaque probleme trouve, tous rapportes en une seule fois.
+validate_additional_deletion_log <- function(df, raw_data_all) {
+  missing_cols <- setdiff(DELETION_LOG_HEADERS, colnames(df))
+  if (length(missing_cols) > 0) {
+    stop("L'onglet 'Journal_suppression' du journal de nettoyage additionnel n'a pas les colonnes attendues ",
+        "(colonnes manquantes : ", paste(missing_cols, collapse = ", "),
+        ") - utilisez le modele telecharge depuis le tableau de bord, sans modifier l'en-tete.")
+  }
+
+  problems <- character(0)
+  for (i in seq_len(nrow(df))) {
+    excel_row <- i + 1  # +1 pour la ligne d'en-tete
+    uuid <- df$uuid[i]
+    reason <- df$reason_deletion[i]
+
+    ref <- paste0("Ligne ", excel_row, " (uuid=", ifelse(is.na(uuid) || !nzchar(uuid), "manquant", uuid), ")")
+
+    if (is.na(uuid) || !nzchar(uuid)) {
+      problems <- c(problems, paste0(ref, " : identifiant d'enquete (uuid) manquant."))
+      next
+    }
+    if (!uuid %in% raw_data_all$uuid) {
+      problems <- c(problems, paste0(ref, " : cet identifiant d'enquete n'existe pas dans les donnees brutes importees."))
+      next
+    }
+    if (is.na(reason) || !nzchar(reason)) {
+      problems <- c(problems, paste0(ref, " : 'reason_deletion' (raison de la suppression) est obligatoire."))
+    }
+  }
+
+  if (length(problems) > 0) {
+    stop("L'onglet 'Journal_suppression' du journal de nettoyage additionnel contient des erreurs - a corriger avant de continuer :\n- ",
+        paste(problems, collapse = "\n- "))
+  }
+
+  invisible(TRUE)
+}
+
+# Lit, valide et prepare l'onglet "Journal_suppression" pour etre concatene avec le classeur "A_verifier"
+# rempli exactement comme prepare_additional_cleaning_log() - memes colonnes internes (question/comment),
+# change_type fixe a "remove_survey" (question=NA, comme les lignes "toute l'enquete" issues de
+# A_verifier). Renvoie NULL si l'onglet est absent (classeur genere par une version anterieure du modele)
+# ou vide (present mais non rempli) - optionnel, ce n'est pas une erreur dans les deux cas.
+prepare_additional_deletion_log <- function(path, raw_data_all) {
+  df <- tryCatch(read_excel(path, sheet = "7_Journal_suppression", col_types = "text"),
+                error = function(e) NULL)
+  if (is.null(df)) return(NULL)
+  df <- df[rowSums(!is.na(df)) > 0, , drop = FALSE]
+  if (nrow(df) == 0) return(NULL)
+
+  validate_additional_deletion_log(df, raw_data_all)
+
+  df %>%
+    transmute(uuid = uuid, question = NA_character_, change_type = "remove_survey",
+             old_value = NA_character_, new_value = NA_character_, issue = NA_character_,
+             comment = reason_deletion)
 }
 
 #############################################################################################################
@@ -1038,12 +1802,18 @@ create_partner_region_summary <- function(data,
 
 # Attache a chaque colonne son etiquette kobo francaise (via le package `labelled`) pour transporter
 # l'etiquette avec les donnees jusqu'au moment ou write_labeled_data_sheet() l'affiche comme ligne
-# d'etiquette de la feuille.
+# d'etiquette de la feuille. Complete aussi les colonnes USD calculees (voir "RECALCUL DES PRIX EN
+# DOLLARS US" dans 2_nettoyage_final.R) qui n'existent pas dans l'outil kobo et n'auraient donc sinon
+# aucune etiquette - price_conversion_labels est defini dans ce meme script (meme environnement
+# d'execution, voir scripts/0_configuration.R) ; absent (raw_data, 1_suivi_quotidien.R) -> ignore.
 apply_var_labels <- function(df){
   lbls <- kobo_survey$`label::french`
   names(lbls) <- kobo_survey$name
-  lbls <- as.list(lbls[intersect(names(df), names(lbls))])
-  labelled::var_label(df) <- lbls
+  lbls <- lbls[intersect(names(df), names(lbls))]
+  if (exists("price_conversion_labels", inherits = TRUE)) {
+    lbls <- c(lbls, price_conversion_labels[intersect(names(df), names(price_conversion_labels))])
+  }
+  labelled::var_label(df) <- as.list(lbls)
   df
 }
 
@@ -1053,6 +1823,7 @@ DARK_GREY_BANNER <- "#818183"
 
 # Une seule ligne d'en-tete figee, fond gris clair - utilisee pour cleaning_log/deletion_log/variable_tracker/survey/choices
 write_simple_sheet <- function(wb, sheet_name, df, auto_width = TRUE){
+  df <- sanitize_df_text(df)
   addWorksheet(wb, sheet_name)
   writeData(wb, sheet_name, df, colNames = TRUE)
   addStyle(wb, sheet_name, style = createStyle(textDecoration = "bold", fgFill = GREY_HEADER), rows = 1, cols = 1:ncol(df))
@@ -1070,6 +1841,8 @@ write_labeled_data_sheet <- function(wb, sheet_name, df){
     lbl <- var_labels[[n]]
     if (is.null(lbl) || is.na(lbl) || !nzchar(lbl)) n else lbl
   }, character(1))
+  label_row <- sanitize_xml_text(label_row)
+  df <- sanitize_df_text(df)
 
   writeData(wb, sheet_name, as.list(label_row), startRow = 1, colNames = FALSE)
   writeData(wb, sheet_name, df, startRow = 2, colNames = TRUE)
@@ -1307,7 +2080,17 @@ build_final_workbook <- function(raw_data_export, clean_data_export, cleaning_lo
   # Utiliser un dossier de mise en attente local stable (hors OneDrive) plutot que tempdir(), pour
   # qu'une copie valide survive toujours entre les sessions R si toutes les tentatives ci-dessous
   # echouent quand meme.
-  stage_dir <- file.path(Sys.getenv("LOCALAPPDATA"), "jmmi_car_build")
+  # LOCALAPPDATA n'existe que sous Windows - vide (donc "") sur toute autre plateforme (ex. serveur
+  # Linux type Posit Connect), ce qui ferait pointer file.path() vers la RACINE du systeme de fichiers
+  # ("/jmmi_car_build") au lieu d'un dossier local. Repli sur tempdir() dans ce cas : le probleme de
+  # verrouillage OneDrive que ce dossier de mise en attente contourne est de toute facon propre a
+  # Windows (pas de OneDrive sur un serveur Linux), donc perdre la persistance entre sessions R n'a pas
+  # d'impact la ou ce mecanisme n'a pas de raison d'etre sollicite.
+  stage_dir <- if (nzchar(Sys.getenv("LOCALAPPDATA"))) {
+    file.path(Sys.getenv("LOCALAPPDATA"), "jmmi_car_build")
+  } else {
+    file.path(tempdir(), "jmmi_car_build")
+  }
   if (!dir.exists(stage_dir)) dir.create(stage_dir, recursive = TRUE)
   tmp_path <- file.path(stage_dir, basename(output_path))
   saveWorkbook(wb, tmp_path, overwrite = TRUE)

@@ -28,7 +28,7 @@
 rm(list=ls())
 
 # chargement des packages, des fonctions et de la liste de variables predefinies
-source("scripts/0_configuration.R")
+source("scripts/0_configuration.R", local = TRUE)
 
 ################################################################################
 # CHARGEMENT DU JEU DE DONNEES BRUT

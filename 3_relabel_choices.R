@@ -28,7 +28,7 @@ library(openxlsx)
 library(dplyr)
 library(stringr)
 
-source("scripts/fonctions_relabel.R")
+source("scripts/fonctions_relabel.R", local = TRUE)
 
 cat("--> Chargement de l'outil kobo...\n")
 kobo_survey <- read_excel(Sys.getenv("kobo_tool_file"), sheet = "survey", col_types = "text") %>% rename_with(tolower)
