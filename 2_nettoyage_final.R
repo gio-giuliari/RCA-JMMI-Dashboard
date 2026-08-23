@@ -238,12 +238,27 @@ days_db <- kobo_survey %>%
 # trouvee, auquel cas la ligne _price_item d'origine est conservee telle quelle (repli explicite, voir
 # expand_price_item_row() plus bas).
 item_prefixes <- sub("_price_item$", "", items_list)
+# certains articles ont un champ INTERMEDIAIRE qui se termine lui aussi par "_price_unit_item" (ex.
+# "bucket_20l_price_unit_item", "salt_150g_price_unit_item") tout en etant LUI-MEME un champ CALCULATE
+# de l'outil kobo (recalcule par recompute_price_items() a partir des VRAIS champs saisis, ex.
+# "bucket_price_unit_item"/"bucket_other_unit_item"/"bucket_std_unit_item") - le suffixe seul ne les
+# distingue pas des champs reellement saisis. calculated_fields (ci-dessous) marque ces variables :
+# write_review_sheet() verrouille leur cellule "Nouvelle reponse" dans Verification_prix (voir plus bas)
+# pour eviter qu'une correction y soit tapee sans jamais prendre effet - recompute_price_items() les
+# ECRASE INCONDITIONNELLEMENT depuis les VRAIS champs saisis, quelle que soit la valeur du journal de
+# nettoyage pour ce champ precis (bug constate : le journal affirmait la correction appliquee alors que
+# clean_data gardait l'ancienne valeur, silencieusement recalculee depuis les champs source inchanges).
+calculated_field_names <- kobo_survey$name[kobo_survey$type == "calculate"]
 get_item_block <- function(prefix) {
   cand <- kobo_survey$name[str_starts(kobo_survey$name, fixed(paste0(prefix, "_")))]
+  price_unit <- intersect(cand[str_ends(cand, "_price_unit_item")], colnames(raw_data_all))
+  std_unit <- intersect(cand[str_ends(cand, "_std_unit_item")], colnames(raw_data_all))
+  other_unit <- intersect(cand[str_ends(cand, "_other_unit_item")], colnames(raw_data_all))
   list(
-    price_unit = intersect(cand[str_ends(cand, "_price_unit_item")], colnames(raw_data_all)),
-    std_unit = intersect(cand[str_ends(cand, "_std_unit_item")], colnames(raw_data_all)),
-    other_unit = intersect(cand[str_ends(cand, "_other_unit_item")], colnames(raw_data_all))
+    price_unit = price_unit,
+    std_unit = std_unit,
+    other_unit = other_unit,
+    calculated = intersect(c(price_unit, std_unit, other_unit), calculated_field_names)
   )
 }
 item_blocks <- setNames(lapply(item_prefixes, get_item_block), item_prefixes)
@@ -504,6 +519,10 @@ expand_price_item_row <- function(row) {
   if (length(block_vars) == 0) {
     row$block_id <- NA_character_
     row$block_role <- NA_character_
+    # repli : la ligne _price_item d'origine elle-meme, TOUJOURS un champ CALCULATE par definition
+    # (voir items_list) - la verrouiller aussi (voir calculated_field_names/is_calculated_field plus
+    # haut), pour la meme raison que les variables intermediaires du bloc.
+    row$is_calculated_field <- TRUE
     return(row)
   }
   raw_row <- raw_data_all[raw_data_all$uuid == row$uuid[1], ]
@@ -516,6 +535,7 @@ expand_price_item_row <- function(row) {
   out$block_id <- paste0(row$uuid[1], "__", item_prefix)
   out$block_role <- ifelse(block_vars %in% block$price_unit, "prix", "contexte")
   out$issue <- ifelse(out$block_role == "prix", row$issue[1], "Variable liee au prix ci-dessus")
+  out$is_calculated_field <- block_vars %in% block$calculated
   out
 }
 
@@ -529,6 +549,7 @@ if (nrow(df_outliers_prix_raw) > 0) {
   df_outliers_prix <- df_outliers_prix_raw
   df_outliers_prix$block_id <- character(0)
   df_outliers_prix$block_role <- character(0)
+  df_outliers_prix$is_calculated_field <- logical(0)
 }
 
 # 4) quasi-doublons (enquetes tres semblables entre elles) - un probleme au niveau de l'enquete
@@ -655,7 +676,8 @@ review_df_prix <- df_outliers_prix %>%
     nouvelle_reponse = NA_character_,
     commentaire = NA_character_,
     block_id = block_id,
-    block_role = block_role
+    block_role = block_role,
+    is_calculated_field = is_calculated_field
   ) %>%
   # uuid ajoute au tri (en plus de partenaire/date, deja identiques pour toutes les lignes d'un meme
   # bloc) pour garantir que les lignes d'un meme bloc restent bien ADJACENTES apres le tri, quel que

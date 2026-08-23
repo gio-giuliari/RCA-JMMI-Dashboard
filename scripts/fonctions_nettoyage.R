@@ -1030,6 +1030,19 @@ write_review_sheet <- function(wb, df, sheet_name = "3_A_verifier") {
   # colonnes de REVIEW_HEADERS_FR (donc jamais affichee comme colonne), seulement utilisee ici pour
   # appliquer un bandeau de couleur alterne aux lignes d'un meme bloc (voir plus bas).
   block_id <- if ("block_id" %in% colnames(df)) df$block_id else rep(NA_character_, nrow(df))
+  # is_calculated_field (Verification_prix uniquement - voir expand_price_item_row() dans
+  # 2_nettoyage_final.R) : certaines variables du bloc (ex. "bucket_20l_price_unit_item") sont elles-
+  # memes un champ CALCULATE de l'outil kobo, ECRASE INCONDITIONNELLEMENT par recompute_price_items()
+  # quelle que soit la valeur tapee ici - "Que faire ?"/"Nouvelle reponse" sont verrouillees pour ces
+  # lignes plus bas (apres le bandeau de bloc), pour eviter qu'une correction y semble acceptee (le
+  # journal de nettoyage l'enregistrerait) alors qu'elle n'a en realite AUCUN EFFET sur clean_data - bug
+  # constate, corrige en empechant la saisie plutot qu'en la laissant silencieusement ignoree.
+  is_calculated_field <- if ("is_calculated_field" %in% colnames(df)) {
+    df$is_calculated_field
+  } else {
+    rep(FALSE, nrow(df))
+  }
+  is_calculated_field[is.na(is_calculated_field)] <- FALSE
 
   df_display <- df %>% select(names(REVIEW_HEADERS_FR))
   colnames(df_display) <- unname(REVIEW_HEADERS_FR[colnames(df_display)])
@@ -1163,6 +1176,18 @@ write_review_sheet <- function(wb, df, sheet_name = "3_A_verifier") {
       queue_list_validation(sheet_name, col = nouvelle_reponse_col, rows = target_rows,
                             list_range = list_values)
     }
+  }
+
+  # verrouille "Que faire ?"/"Nouvelle reponse" pour les lignes marquees is_calculated_field (voir le
+  # commentaire en tete de fonction) - APRES le bandeau de bloc ci-dessus, pour bien le remplacer sur ces
+  # cellules precises (un addStyle() ulterieur remplace entierement le style existant sur les memes
+  # cellules). Fond gris distinct du reste du bloc, meme principe visuel que les colonnes techniques
+  # "ne pas modifier" - pour que ce soit immediatement visible, pas juste techniquement bloque.
+  calculated_rows <- which(is_calculated_field) + 1  # +1 pour la ligne d'en-tete
+  if (length(calculated_rows) > 0) {
+    addStyle(wb, sheet_name, style = createStyle(fgFill = GREY_HEADER, fontColour = "#595959", wrapText = TRUE,
+                                                 valign = "top", locked = TRUE),
+             rows = calculated_rows, cols = c(action_col, nouvelle_reponse_col), gridExpand = TRUE)
   }
 
   # colonnes elargies (notamment "Nouvelle reponse", au libelle tres long) pour que le texte de l'entete
