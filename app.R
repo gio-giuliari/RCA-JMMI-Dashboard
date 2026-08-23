@@ -471,17 +471,29 @@ run_analyse_pipeline <- function(clean_data_path,
   dir.create(file.path(tmp, "scripts"), recursive = TRUE)
   dir.create(file.path(tmp, "output"), recursive = TRUE)
 
+  dir.create(file.path(tmp, "ressources"), recursive = TRUE)
+
   file.copy(file.path(PIPELINE_ROOT, "scripts", "fonctions_analyse.R"),
             file.path(tmp, "scripts", "fonctions_analyse.R"), overwrite = TRUE)
   file.copy(file.path(PIPELINE_ROOT, "scripts", "mfs.R"),
             file.path(tmp, "scripts", "mfs.R"), overwrite = TRUE)
+  # mise en forme de la feuille "Analyse" (voir format_analysis_results() dans 4_analyse_complete.R)
+  file.copy(file.path(PIPELINE_ROOT, "scripts", "format_results.R"),
+            file.path(tmp, "scripts", "format_results.R"), overwrite = TRUE)
   file.copy(file.path(PIPELINE_ROOT, "4_analyse_complete.R"),
             file.path(tmp, "4_analyse_complete.R"), overwrite = TRUE)
+  # modele de checklist (voir CHECKLIST_TEMPLATE_NAME) : sa feuille "CHECKLIST_Data_Cleaning" vierge est
+  # clonee telle quelle dans le classeur d'analyse (onglet "Checklist_Data_Analysis", juste apres la
+  # feuille "CHECKLIST_Data_Cleaning" deja auto-remplie issue du nettoyage) - demande utilisateur.
+  file.copy(file.path(PIPELINE_ROOT, "ressources", CHECKLIST_TEMPLATE_NAME),
+            file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME), overwrite = TRUE)
 
   required_resources <- c(
     file.path(tmp, "scripts", "fonctions_analyse.R"),
     file.path(tmp, "scripts", "mfs.R"),
-    file.path(tmp, "4_analyse_complete.R")
+    file.path(tmp, "scripts", "format_results.R"),
+    file.path(tmp, "4_analyse_complete.R"),
+    file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME)
   )
   missing_resources <- required_resources[!file.exists(required_resources) | file.size(required_resources) %in% c(0, NA)]
   if (length(missing_resources) > 0) {
@@ -505,7 +517,8 @@ run_analyse_pipeline <- function(clean_data_path,
     clean_data_file = file.path(tmp, "input", "clean_data.xlsx"),
     kobo_tool_file = file.path(tmp, "input", "kobo_tool.xlsx"),
     eur_xrate = "655.95",
-    output_dir = paste0(file.path(tmp, "output"), "/")
+    output_dir = paste0(file.path(tmp, "output"), "/"),
+    checklist_template = file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME)
   )
   if (!is.null(previous_clean_path)) {
     file.copy(previous_clean_path, file.path(tmp, "input", "previous_clean_data.xlsx"), overwrite = TRUE)

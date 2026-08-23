@@ -38,6 +38,7 @@ options(dplyr.summarise.inform = FALSE)
 
 source("scripts/fonctions_analyse.R", local = TRUE)
 source("scripts/mfs.R", local = TRUE)
+source("scripts/format_results.R", local = TRUE)
 
 ################################################################################
 # PARAMETRES (variables d'environnement - voir run_analyse_pipeline() dans app.R)
@@ -81,6 +82,23 @@ cat("\n- LECTURE du classeur de nettoyage :", INPUT_PATH, "...\n")
 wb_final <- wb_load(INPUT_PATH)
 cleaning_sheet_names <- wb_get_sheet_names(wb_final)
 cat("  feuilles trouvees :", paste(cleaning_sheet_names, collapse = ", "), "\n")
+
+# garde-fou : le classeur importe doit etre la sortie "Finale" du NETTOYAGE, pas un classeur d'ANALYSE
+# deja produit (par erreur de reimport, ex. l'utilisateur reimporte le fichier telecharge la fois
+# precedente). Sans ce controle, wb_add_worksheet() ci-dessous ne detecte PAS le nom de feuille deja
+# present (aucune erreur a ce stade) et les wb_merge_cells() suivants finissent par entrer en collision
+# avec les fusions DEJA presentes dans l'ancienne feuille de meme nom, avec un message cryptique
+# ("Merge intersects with existing merged cells") qui ne dit rien sur la vraie cause - repere/reproduit
+# en importatant un classeur d'analyse deja produit comme classeur "Finale".
+ANALYSIS_SHEET_NAMES <- c("Coût médian du PMAS", "Composition du PMAS", "Evolution des paniers du PMAS",
+                          "Prix médian par article", "Score de Fonctionnalité", "Checklist_Data_Analysis")
+already_analysed_sheets <- intersect(ANALYSIS_SHEET_NAMES, cleaning_sheet_names)
+if (length(already_analysed_sheets) > 0) {
+  stop("Le classeur importé contient déjà des feuilles d'analyse (", paste(already_analysed_sheets, collapse = ", "),
+      ") : il s'agit probablement d'un classeur d'ANALYSE déjà produit, pas du classeur \"Finale\" issu du ",
+      "nettoyage. Réimportez le classeur produit par l'étape \"Finale\" du nettoyage (pas un fichier déjà ",
+      "téléchargé depuis cette étape \"Analyse\").")
+}
 
 raw_data_all <- read_excel(INPUT_PATH, sheet = "raw_data", col_types = "text")
 clean_data <- read_excel(INPUT_PATH, sheet = "clean_data", skip = 1, col_types = "text")
@@ -682,11 +700,11 @@ score_fonctionnalite <- mfs_raw %>%
   transmute(
     `Année` = ANNEE, Mois = MOIS, Pays = PAYS,
     `Préfecture` = admin1_label, `Sous-préfecture` = admin2_label, Commune = admin3_label,
-    `Accessibilité des marchés` = round(mfs_accessibility_pillar_score / 100, 2),
-    `Disponibilité des produits` = round(mfs_availability_pillar_score / 100, 2),
-    `Abordabilité des prix des produits` = round(mfs_affordability_pillar_score / 100, 2),
-    `Résilience des circuits d'approvisionnement` = round(mfs_resilience_pillar_score / 100, 2),
-    `Niveau des infrastructures du marché` = round(mfs_infrastructure_pillar_score / 100, 2),
+    `Accessibilité des marchés (score maximum : 25)` = round(mfs_accessibility_pillar_score, 0),
+    `Disponibilité des produits (score maximum : 30)` = round(mfs_availability_pillar_score, 0),
+    `Abordabilité des prix des produits (score maximum : 15)` = round(mfs_affordability_pillar_score, 0),
+    `Résilience des circuits d'approvisionnement (score maximum : 20)` = round(mfs_resilience_pillar_score, 0),
+    `Niveau des infrastructures du marché (score maximum : 10)` = round(mfs_infrastructure_pillar_score, 0),
     `Total Score SFM` = round(mfs_score / 100, 2),
     !!paste0("Classification SFM ", MOIS, " ", ANNEE) := functionality
   ) %>%
@@ -697,9 +715,12 @@ wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", score_fonctionnali
 
 # mise en forme reprise du classeur de reference REACH_CAR_JMMI_Dataset_Analyse_Juin_Juillet_2026 (memes
 # constantes que "Coût médian du PMAS" ci-dessus : en-tete fond rouge corail FFEE5958 + police Roboto
-# Condensed 14 gras texte blanc ; corps police Segoe UI 12 BODY_GREY, colonnes de score au format
-# pourcentage (numFmt Excel integre id 9 - "0%", puisque mfs_*_pillar_score/100 est deja une fraction
-# 0-1) ; "Total Score SFM" en gras 14pt (comme les colonnes "Total" de PMAS). Pas de ligne/colonne
+# Condensed 14 gras texte blanc ; corps police Segoe UI 12 BODY_GREY, colonnes de pilier en entiers (le
+# score maximum de chaque pilier - 25/30/15/20/10 - est indique directement dans l'en-tete de colonne,
+# demande utilisateur, plutot qu'un affichage en pourcentage qui masquerait ces poids differents) ;
+# "Total Score SFM" reste en pourcentage (c'est bien un pourcentage du score total sur 100, contrairement
+# aux piliers qui ont chacun un maximum different) et en gras 14pt (comme les colonnes "Total" de PMAS).
+# Pas de ligne/colonne
 # d'espacement au debut (contrairement au classeur de reference) : convention deja etablie par "Coût
 # médian du PMAS" dans ce classeur, gardee identique ici pour la coherence entre les deux feuilles. Pas
 # non plus des 3 niveaux d'agregation Sous-Prefecture/Prefecture/National du classeur de reference
@@ -729,7 +750,8 @@ wb_final <- wb_add_font(wb_final, "Score de Fonctionnalité", dims = wb_dims(row
 wb_final <- wb_add_cell_style(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = body_rows_mfs, cols = c(1,2,3,7:12)), horizontal = "center", vertical = "center")
 wb_final <- wb_add_cell_style(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = body_rows_mfs, cols = 4:6), horizontal = "left", vertical = "center", indent = 1)
 wb_final <- wb_add_cell_style(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = body_rows_mfs, cols = classif_col), horizontal = "left", vertical = "center", wrap_text = "1")
-wb_final <- wb_add_numfmt(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = body_rows_mfs, cols = 7:12), numfmt = "0%")
+wb_final <- wb_add_numfmt(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = body_rows_mfs, cols = 7:11), numfmt = "0")
+wb_final <- wb_add_numfmt(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = body_rows_mfs, cols = 12), numfmt = "0%")
 
 # code couleur de la classification (fond plein par categorie, meme palette que le classeur de reference
 # - "Donnees insuffisantes" n'a pas de fond, seulement un texte rouge, contrairement aux 4 autres) -
@@ -762,37 +784,220 @@ wb_final <- wb_freeze_pane(wb_final, "Score de Fonctionnalité", firstActiveRow 
 cat("  ..OK (", nrow(score_fonctionnalite), " communes, ",
    sum(is.na(score_fonctionnalite$`Total Score SFM`)), " avec donnees insuffisantes)\n", sep = "")
 
+# legende visuelle sous le tableau (memes couleurs que MFS_CATEGORY_STYLES/la colonne "Classification
+# SFM" ci-dessus, seuils de score simplifies fournis par l'utilisateur pour la legende - le calcul reel
+# de calculate_mfs() combine score total ET nombre de dimensions basses, voir Methodologie_MFS.md, mais
+# la legende reste une lecture simplifiee par seuil de score, comme dans le classeur de reference)
+legend_title_row <- last_row_mfs + 3
+legend_header_row <- legend_title_row + 2
+legend_data_rows <- (legend_header_row + 1):(legend_header_row + 4)
+legend_cols <- 1:4  # A:D
+legend_range_cols <- 1:2   # A:B - "Plage de score"
+legend_class_cols <- 3:4  # C:D - "Classification"
+
+wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité",
+                        data.frame("Classification des marchés en fonction du score de fonctionnalité"),
+                        start_row = legend_title_row, start_col = 1, col_names = FALSE)
+wb_final <- wb_merge_cells(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = legend_title_row, cols = legend_cols))
+wb_final <- wb_add_font(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = legend_title_row, cols = legend_cols[1]),
+                        name = "Segoe UI", size = 14, bold = TRUE, color = wb_color(hex = BODY_GREY))
+wb_final <- wb_add_cell_style(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = legend_title_row, cols = legend_cols[1]), vertical = "center")
+
+# en-tetes des 2 colonnes (demande utilisateur : la legende passe d'un texte fusionne par ligne a un
+# tableau a 2 colonnes - plage de score / classification - chacune toujours coloree par categorie)
+wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", data.frame("Plage de score"), start_row = legend_header_row, start_col = legend_range_cols[1], col_names = FALSE)
+wb_final <- wb_merge_cells(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = legend_header_row, cols = legend_range_cols))
+wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", data.frame("Classification"), start_row = legend_header_row, start_col = legend_class_cols[1], col_names = FALSE)
+wb_final <- wb_merge_cells(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = legend_header_row, cols = legend_class_cols))
+wb_final <- wb_add_font(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = legend_header_row, cols = c(legend_range_cols[1], legend_class_cols[1])),
+                        name = "Segoe UI", size = 12, bold = TRUE, color = wb_color(hex = BODY_GREY))
+wb_final <- wb_add_cell_style(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = legend_header_row, cols = legend_cols), horizontal = "left", vertical = "center", indent = 1)
+
+MFS_LEGEND_ITEMS <- list(
+  list(range = "Score < 25 %", classification = "Problèmes graves", fill = MFS_CATEGORY_STYLES[["Problèmes graves"]]$fill),
+  list(range = "Score entre 26 % et 49 %", classification = "Mauvaise fonctionnalité", fill = MFS_CATEGORY_STYLES[["Mauvaise fonctionnalité"]]$fill),
+  list(range = "Score entre 50 % et 79 %", classification = "Fonctionnalité limitée", fill = MFS_CATEGORY_STYLES[["Fonctionnalité limitée"]]$fill),
+  list(range = "Score ≥ 80 %", classification = "Fonctionnalité complète", fill = MFS_CATEGORY_STYLES[["Fonctionnalité complète"]]$fill)
+)
+for (i in seq_along(MFS_LEGEND_ITEMS)) {
+  item <- MFS_LEGEND_ITEMS[[i]]
+  r <- legend_data_rows[i]
+  wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", data.frame(item$range), start_row = r, start_col = legend_range_cols[1], col_names = FALSE)
+  wb_final <- wb_merge_cells(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = r, cols = legend_range_cols))
+  wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", data.frame(item$classification), start_row = r, start_col = legend_class_cols[1], col_names = FALSE)
+  wb_final <- wb_merge_cells(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = r, cols = legend_class_cols))
+  wb_final <- wb_add_fill(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = r, cols = legend_cols), color = wb_color(hex = item$fill))
+  wb_final <- wb_add_font(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = r, cols = c(legend_range_cols[1], legend_class_cols[1])),
+                          name = "Segoe UI", size = 12, bold = TRUE, color = wb_color(hex = BODY_GREY))
+  wb_final <- wb_add_cell_style(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = r, cols = legend_cols), horizontal = "left", vertical = "center", indent = 1)
+}
+wb_final <- wb_add_border(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = c(legend_header_row, legend_data_rows), cols = legend_cols),
+                          inner_hgrid = "thin", inner_vgrid = "thin", top_border = "thin", bottom_border = "thin", left_border = "thin", right_border = "thin")
+wb_final <- wb_set_row_heights(wb_final, "Score de Fonctionnalité", rows = c(legend_title_row, legend_header_row, legend_data_rows), heights = 22)
+
+# tableau des poids ET definitions des dimensions du SFM (demande utilisateur - les poids sont deja
+# indiques dans les en-tetes de colonne ci-dessus, repris ici sous forme de tableau ; la colonne
+# "Définition" reprend la traduction francaise complete (pas un resume) des questions-guides de la
+# methodologie MFS de REACH pour chaque dimension, fournies par l'utilisateur en anglais - voir
+# Methodologie_MFS.md pour le document source.
+weights_title_row <- legend_data_rows[length(legend_data_rows)] + 3
+weights_header_row <- weights_title_row + 2
+weights_data_rows <- (weights_header_row + 1):(weights_header_row + 5)
+name_cols <- 1:3
+max_col <- 4
+def_cols <- 5:13
+
+wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", data.frame("SFM : poids et définitions des dimensions"),
+                        start_row = weights_title_row, start_col = 1, col_names = FALSE)
+wb_final <- wb_merge_cells(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = weights_title_row, cols = 1:13))
+wb_final <- wb_add_font(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = weights_title_row, cols = 1),
+                        name = "Segoe UI", size = 14, bold = TRUE, color = wb_color(hex = BODY_GREY))
+wb_final <- wb_add_cell_style(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = weights_title_row, cols = 1), vertical = "center")
+
+wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", data.frame("Dimension"), start_row = weights_header_row, start_col = name_cols[1], col_names = FALSE)
+wb_final <- wb_merge_cells(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = weights_header_row, cols = name_cols))
+wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", data.frame("Score maximum"), start_row = weights_header_row, start_col = max_col, col_names = FALSE)
+wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", data.frame("Définition"), start_row = weights_header_row, start_col = def_cols[1], col_names = FALSE)
+wb_final <- wb_merge_cells(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = weights_header_row, cols = def_cols))
+wb_final <- wb_add_font(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = weights_header_row, cols = c(name_cols[1], max_col, def_cols[1])),
+                        name = "Segoe UI", size = 12, bold = TRUE, color = wb_color(hex = BODY_GREY))
+wb_final <- wb_add_cell_style(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = weights_header_row, cols = 1:13), horizontal = "left", vertical = "center", indent = 1)
+
+MFS_DIMENSION_DEFS <- list(
+  list(name = "Accessibilité des marchés", max = 25,
+       def = paste(
+         "Tous les acteurs du marché, y compris les clients, ont-ils un accès physique à ce marché (c'est-à-dire que la plupart des personnes peuvent se rendre sur les marchés et/ou dans les commerces et y entrer depuis leur lieu d'hébergement sans effort physique ou coût majeur, et que les clients sont physiquement capables de ramener les biens achetés chez eux en quantité suffisante) ?",
+         "Tous les acteurs du marché, y compris les clients, ont-ils un accès social à ce marché (c'est-à-dire qu'ils ne sont pas empêchés d'accéder aux marchés et/ou aux commerces, ou d'obtenir des biens, en raison de leur genre, de leur appartenance ethnique, de leur affiliation, ou d'autres caractéristiques physiques ou sociales) ?",
+         "Ce marché et les routes qui y mènent sont-ils sûrs et sécurisés (c'est-à-dire que les clients et les autres acteurs du marché peuvent se rendre sur les marchés et/ou dans les commerces sans mettre leur sécurité en danger) ?"
+       )),
+  list(name = "Disponibilité des produits", max = 30,
+       def = "Les vendeurs de ce marché peuvent-ils fournir de manière fiable tous les articles essentiels dont les ménages locaux ont besoin d'acheter régulièrement ?"),
+  list(name = "Abordabilité des prix des produits", max = 15,
+       def = paste(
+         "Les clients ont-ils un accès financier à ce marché (c'est-à-dire que les articles essentiels y sont vendus de manière constante à des prix qu'un ménage local moyen peut se permettre) ?",
+         "Les prix des articles essentiels sont-ils stables sur ce marché (c'est-à-dire qu'ils évoluent assez lentement pour permettre aux vendeurs et aux clients de planifier leurs dépenses futures) ?"
+       )),
+  list(name = "Résilience des circuits d'approvisionnement", max = 20,
+       def = paste(
+         "Les chaînes d'approvisionnement des articles essentiels sur ce marché fonctionnent-elles de manière fiable ?",
+         "Les vendeurs de ce marché sont-ils systématiquement en mesure de réapprovisionner les articles essentiels qu'ils vendent avant d'en manquer ?",
+         "Les acteurs de ce marché s'approvisionnent-ils en biens auprès de villes et/ou d'itinéraires d'approvisionnement variés, ou la plupart des biens arrivent-ils sur ce marché via un itinéraire d'approvisionnement unique susceptible d'être perturbé ?"
+       )),
+  list(name = "Niveau des infrastructures du marché", max = 10,
+       def = paste(
+         "Les infrastructures physiques dans et autour de ce marché (bâtiments, routes, etc.) sont-elles en assez bon état pour soutenir les activités normales de subsistance et de commerce ?",
+         "Les vendeurs de ce marché ont-ils accès à des installations de stockage sécurisées et verrouillables pour conserver leur stock ?",
+         "Une infrastructure financière existe-t-elle sur ce marché pour soutenir des modalités de paiement alternatives, au-delà de l'argent liquide physique et du crédit informel ?"
+       ))
+)
+for (i in seq_along(MFS_DIMENSION_DEFS)) {
+  d <- MFS_DIMENSION_DEFS[[i]]
+  r <- weights_data_rows[i]
+  wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", data.frame(d$name), start_row = r, start_col = name_cols[1], col_names = FALSE)
+  wb_final <- wb_merge_cells(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = r, cols = name_cols))
+  wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", data.frame(paste0(d$max, " / 100")), start_row = r, start_col = max_col, col_names = FALSE)
+  wb_final <- wb_add_data(wb_final, "Score de Fonctionnalité", data.frame(d$def), start_row = r, start_col = def_cols[1], col_names = FALSE)
+  wb_final <- wb_merge_cells(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = r, cols = def_cols))
+  wb_final <- wb_add_font(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = r, cols = c(name_cols[1], max_col, def_cols[1])),
+                          name = "Segoe UI", size = 11, color = wb_color(hex = BODY_GREY))
+  wb_final <- wb_add_font(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = r, cols = name_cols[1]),
+                          name = "Segoe UI", size = 11, bold = TRUE, color = wb_color(hex = BODY_GREY))
+  wb_final <- wb_add_cell_style(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = r, cols = 1:13), horizontal = "left", vertical = "top", indent = 1, wrap_text = "1")
+}
+wb_final <- wb_add_cell_style(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = weights_data_rows, cols = max_col), horizontal = "center")
+wb_final <- wb_add_border(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = c(weights_header_row, weights_data_rows), cols = 1:13),
+                          inner_hgrid = "thin", inner_vgrid = "thin", top_border = "thin", bottom_border = "thin", left_border = "thin", right_border = "thin")
+# hauteur de ligne proportionnelle a la longueur du texte de definition (traduction complete, pas un
+# resume - la largeur fusionnee E:M fait environ 210 caracteres, ~15px par ligne de texte a 11pt)
+def_chars_per_line <- 210
+def_row_heights <- pmax(30, ceiling(nchar(sapply(MFS_DIMENSION_DEFS, function(d) d$def)) / def_chars_per_line) * 15 + 10)
+wb_final <- wb_set_row_heights(wb_final, "Score de Fonctionnalité", rows = weights_data_rows, heights = def_row_heights)
+wb_final <- wb_set_row_heights(wb_final, "Score de Fonctionnalité", rows = c(weights_title_row, weights_header_row), heights = 22)
+
 ################################################################################
-# "ANALYSE" (LOA descriptive) -- DESACTIVEE TEMPORAIREMENT (demande utilisateur : cette section est
-# lente a executer). Decommenter le bloc if (FALSE) ci-dessous pour la reactiver.
+# "ANALYSE" (LOA descriptive - reinstauree, demande utilisateur : mise en forme via
+# scripts/format_results.R::format_analysis_results() (fournie par l'utilisateur, deplacee ici depuis la
+# racine du projet, couleur d'accent changee de #A04040 a #D2CBB8 sur demande), LOA inspiree de
+# RCA_JMMI_loa.xlsx, chaque variable desagregee au niveau national (colonne "Total") ET par
+# sous-prefecture (une colonne par sous-prefecture) - format_analysis_results() distingue nativement les
+# lignes group_var = NA (colonne "Total"/nationale) des lignes group_var = "admin2_label" (une colonne
+# par groupe), sans jamais fusionner deux variables techniques differentes entre elles - contrairement a
+# l'ancienne approche par pivot_wider() sur les libelles (abandonnee) qui fusionnait a tort les variables
+# techniques partageant un meme libelle generique reutilise par article dans l'outil kobo (ex. "Précisez
+# la préfecture de provenance:" repete pour 23 articles differents) et faisait planter l'export xlsx.
 ################################################################################
-if (FALSE) {
 cat("\n- ANALYSE DESCRIPTIVE (feuille 'Analyse') ...\n")
-my_loa <- build_loa(kobo_survey, group_var = "admin3_label")
+
+# la loa generee melange, pour chaque variable, une passe nationale (group_var = NA, placee en premier)
+# et une passe par sous-prefecture (group_var = "admin2_label") - voir build_loa() dans
+# scripts/fonctions_analyse.R. price_vars reprend le catalogue deja resolu par la feuille "Prix median
+# par article" ci-dessus (memes variables techniques "<item>_price_item", deja filtrees aux articles
+# reellement presents ce mois-ci) plutot que de re-deviner les noms de colonnes de prix depuis l'outil
+# kobo - evite toute divergence entre les deux feuilles.
+my_loa <- build_loa(kobo_survey, group_var = "admin2_label", price_vars = as.character(PRICE_ITEM_CATALOG$item_var))
 missing_vars <- setdiff(my_loa$analysis_var, colnames(clean_data))
 if (length(missing_vars) > 0) {
   cat("  (", length(missing_vars), " variable(s) de l'outil absente(s) de clean_data, ignorees)\n", sep = "")
   my_loa <- my_loa %>% filter(analysis_var %in% colnames(clean_data))
 }
-cat("  LOA generee :", nrow(my_loa), "lignes (", n_distinct(my_loa$analysis_var), "variables )\n")
+cat("  LOA generee :", nrow(my_loa), "lignes (", n_distinct(my_loa$analysis_var), "variables, national + admin2)\n")
 
-my_design <- srvyr::as_survey_design(clean_data)
+# clean_data est lu entierement en texte (voir LECTURE DU CLASSEUR ci-dessus) - les variables de prix
+# (analysis_type = "median") doivent etre numeriques pour srvyr::survey_median(), sans quoi
+# create_analysis() echoue ("Character vectors not allowed in survey functions") - constate a l'usage.
+# Copie de clean_data (pas de modification en place : les autres feuilles de ce script utilisent
+# clean_data en texte, ex. l'etiquetage "Donnees nettoyees").
+median_vars_present <- intersect(unique(my_loa$analysis_var[my_loa$analysis_type == "median"]), colnames(clean_data))
+analyse_data <- clean_data %>% mutate(across(all_of(median_vars_present), as.numeric))
+
+my_design <- srvyr::as_survey_design(analyse_data)
 my_results <- create_analysis(my_design, loa = my_loa, sm_separator = "/")
-gxv <- my_results$results_table %>% create_table_group_x_variable(value_columns = c("stat"))
+
+# format_analysis_results() lit les libelles DIRECTEMENT depuis survey/choices (pas besoin de
+# create_label_dictionary()/add_label_columns_to_results_table() ni de pivot_wider() sur les libelles -
+# elle construit les lignes en iterant par analysis_var technique, donc jamais de collision entre deux
+# variables qui partageraient le meme libelle). kobo_choices n'a qu'une colonne "label" generique (pas
+# de suffixe de langue), kobo_survey n'a que "label::french" (pas de version anglaise dans cet outil) :
+# harmonisees ici sous le nom "label" (copie locale de kobo_survey, ne touche pas l'original utilise
+# ailleurs dans ce script) pour que label_col="label" designe la meme colonne dans les deux feuilles,
+# comme l'exige format_analysis_results() (voir scripts/format_results.R).
+kobo_survey_label <- kobo_survey %>% select(-q_type, -list_name) %>% rename(label = `label::french`)
 
 analyse_tmp_path <- tempfile(fileext = ".xlsx")
-create_xlsx_group_x_variable(gxv, table_sheet = "Analyse", file_path = analyse_tmp_path,
-                             write_file = TRUE, overwrite = TRUE)
+format_analysis_results(
+  results_table = my_results$results_table,
+  survey        = kobo_survey_label,
+  choices       = kobo_choices,
+  output_path   = analyse_tmp_path,
+  label_col     = "label",
+  sheet_name    = "Analyse"
+)
 wb_analyse <- wb_load(analyse_tmp_path)
 wb_final <- wb_clone_worksheet(wb_final, old = "Analyse", new = "Analyse", from = wb_analyse)
 unlink(analyse_tmp_path)
-cat("  ..OK (", ncol(gxv) - 1, " variables x ", nrow(gxv), " communes)\n", sep = "")
+n_admin2 <- n_distinct(my_loa$group_var[!is.na(my_loa$group_var)])
+cat("  ..OK (", n_distinct(my_loa$analysis_var), " variables, national + ", n_admin2, " niveau(x) de desagregation)\n", sep = "")
+
+################################################################################
+# "Checklist_Data_Analysis" - feuille "CHECKLIST_Data_Cleaning" du MODELE de checklist (fichier
+# ressources/Checklist-Template_..._FRENCH.xlsx), clonee telle quelle (vierge, pas l'auto-evaluation
+# deja remplie par le script de nettoyage) sous un nouveau nom - demande utilisateur : "Checklist_Data_
+# Analysis" plutot que le nom complet du fichier modele (limite Excel de 31 caracteres pour un nom
+# d'onglet, largement depassee par le nom du fichier).
+CHECKLIST_TEMPLATE_FILE <- Sys.getenv("checklist_template")
+if (nzchar(CHECKLIST_TEMPLATE_FILE) && file.exists(CHECKLIST_TEMPLATE_FILE)) {
+  cat("\n- AJOUT de la feuille \"Checklist_Data_Analysis\" (modele de checklist vierge) ...\n")
+  wb_checklist_template <- wb_load(CHECKLIST_TEMPLATE_FILE)
+  wb_final <- wb_clone_worksheet(wb_final, old = "CHECKLIST_Data_Cleaning", new = "Checklist_Data_Analysis",
+                                 from = wb_checklist_template)
+  cat("  ..OK\n")
 }
 
 ################################################################################
 # ORDRE FINAL DES FEUILLES ET SAUVEGARDE
 ################################################################################
-desired_order <- c("READ_ME", "Lisez_moi", "CHECKLIST_Data_Cleaning", "Données nettoyées", "Coût médian du PMAS",
+desired_order <- c("READ_ME", "Lisez_moi", "CHECKLIST_Data_Cleaning", "Checklist_Data_Analysis",
+                   "Données nettoyées", "Coût médian du PMAS",
                    "Composition du PMAS", "Evolution des paniers du PMAS", "Prix médian par article",
                    "Score de Fonctionnalité", "Analyse", "survey", "choices", "raw_data", "clean_data",
                    "cleaning_log", "deletion_log", "variable_tracker")

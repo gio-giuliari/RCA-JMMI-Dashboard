@@ -105,7 +105,9 @@ build_labeled_dataset <- function(clean_data, kobo_survey, kobo_choices) {
 # Construit la LOA directement depuis l'outil kobo (survey/choices) plutot que depuis un fichier DAP
 # maintenu a la main (qui, comme le reste des scripts d'analyse decouverts ce mois-ci, referencait des
 # variables qui n'existent plus) - chaque question select_one/select_multiple pertinente de l'outil
-# devient une ligne de la LOA, desagregee par `group_var`. Voir analysistools::create_analysis().
+# devient une ligne de la LOA, plus une ligne "median" pour chaque variable de `price_vars` (prix des
+# articles - absents de l'outil kobo lui-meme, calcules par le nettoyage, voir PRICE_ITEM_CATALOG dans
+# 4_analyse_complete.R). Voir analysistools::create_analysis().
 # noms des questions telles que nommees dans l'outil kobo (kobo_survey$name) - le pipeline de nettoyage
 # les renomme en admin1_code/admin2_code/admin3_code dans clean_data, mais la LOA doit utiliser les noms
 # D'ORIGINE puisqu'elle est generee depuis kobo_survey
@@ -115,18 +117,32 @@ LOA_EXCLUDE_VARS <- c(
   "shop_category_other", "infrastructure_shop_other"  # texte libre "autre" - pas de choices a analyser
 )
 
-build_loa <- function(kobo_survey, group_var = "admin3_label", level = 0.95, exclude_vars = LOA_EXCLUDE_VARS) {
+# chaque variable est desagregee a DEUX niveaux dans la MEME loa (comme dans RCA_JMMI_loa.xlsx, qui
+# melange des lignes group_var=NA - passe nationale - et group_var=<niveau choisi> - voir son contenu :
+# 124 lignes group_var=NA suivies de 124 lignes group_var="Quelle est la commune?") : la passe nationale
+# est placee EN PREMIER pour chaque variable, ce qui fait apparaitre le niveau national en premiere ligne
+# du tableau pivote (create_table_group_x_variable() respecte l'ordre des lignes de la loa pour ordonner
+# les groupes - constate empiriquement, aucun parametre de tri explicite disponible).
+build_loa <- function(kobo_survey, group_var = "admin2_label", level = 0.95, exclude_vars = LOA_EXCLUDE_VARS,
+                      price_vars = character(0)) {
   eligible <- kobo_survey %>%
     filter(q_type %in% c("select_one", "select_multiple")) %>%
     filter(!name %in% exclude_vars) %>%
     filter(!str_ends(name, "_other")) %>%  # champs texte libre "si autre, precisez" (type="text" de toute facon, garde-fou)
     distinct(name, .keep_all = TRUE)
 
-  tibble(
-    analysis_type = if_else(eligible$q_type == "select_one", "prop_select_one", "prop_select_multiple"),
-    analysis_var = eligible$name,
-    group_var = group_var,
-    level = level
+  all_vars <- bind_rows(
+    tibble(
+      analysis_type = if_else(eligible$q_type == "select_one", "prop_select_one", "prop_select_multiple"),
+      analysis_var = eligible$name
+    ),
+    tibble(analysis_type = "median", analysis_var = price_vars)
+  )
+
+  grp <- group_var  # copie locale - evite toute ambiguite entre le parametre et la colonne du meme nom cree ci-dessous
+  bind_rows(
+    all_vars %>% mutate(group_var = NA_character_, level = level),
+    all_vars %>% mutate(group_var = grp, level = level)
   )
 }
 
