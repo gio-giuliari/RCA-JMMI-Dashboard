@@ -198,13 +198,19 @@ ui <- shiny::bootstrapPage(
               ## MEB_BASKET_MIN_STANDALONE, MEB_BASKET_MIN_CAUTION.
               div(class = "info-box",
                 div(class = "info-title", "Comment le PMAS est calculé (feuille \"Coût médian du PMAS\")"),
-                div(class = "info-row", "1. Prix médian par article : à chaque niveau (Commune, Sous-Préfecture, Préfecture, National), le prix médian d'un article n'est calculé à partir des prix collectés localement que s'il y a au moins 3 prix disponibles pour cet article à ce niveau - sauf pour la viande de bœuf, où 1 seul prix suffit."),
+                div(class = "info-row", "1. Marché = Commune : chaque commune évaluée correspond à un marché (plusieurs vendeurs y sont enquêtés). Le prix médian de chaque article y est calculé directement à partir des prix individuels collectés auprès de ses vendeurs (voir la feuille \"Prix médian par article\") ; chaque commune compose ensuite SON PROPRE panier (alimentaire/non alimentaire/hygiène/total) à partir de ces prix médians et des poids du PMAS (voir la feuille \"meb_composition\")."),
                 div(class = "blue-line"),
-                div(class = "info-row", "2. PMAS total : calculé seulement si au moins 12 des 17 articles ont un prix médian local suffisant (règle 1). Les articles restants (jusqu'à 5) sont alors complétés par la médiane nationale de cet article, pour pouvoir quand même calculer un total complet."),
+                div(class = "info-row", "2. National = médiane des paniers communaux déjà calculés : le panier national N'EST PAS recomposé à partir de prix par article agrégés au niveau national, mais correspond à la médiane des paniers (alimentaire, non alimentaire, hygiène, total) déjà calculés pour chaque commune (règle 1) - chaque commune compte pour une seule observation, et chaque panier est médianné indépendamment des trois autres."),
                 div(class = "blue-line"),
-                div(class = "info-row", "3. Moins de 12 articles disponibles localement : le PMAS total n'est PAS calculé, mais chaque panier est calculé séparément dès que son propre seuil est atteint - panier alimentaire si au moins 6 des 9 produits alimentaires sont disponibles, panier non alimentaire si au moins 4 des 6 produits sont disponibles, panier d'hygiène si les 2 produits sont disponibles (les articles manquants dans un panier calculé sont complétés par la médiane nationale). Une note l'indique dans la colonne \"Note\"."),
+                div(class = "info-row", "3. Suffisance des données (au niveau d'une commune) : un article est considéré \"mesuré localement\" dans un marché s'il y a au moins 3 prix locaux disponibles pour cet article dans ce marché - sauf pour la viande de bœuf, où 1 seul prix suffit. Sinon, la médiane nationale des médianes de marché (voir feuille \"Prix médian par article\") est utilisée comme valeur de secours pour cet article dans ce marché, afin que la commune puisse quand même composer son propre panier."),
                 div(class = "blue-line"),
-                div(class = "info-row", "4. Entre 12 et 14 articles disponibles : le PMAS total est calculé, mais si un panier a été calculé avec peu de prix locaux (moins de 6/9 pour l'alimentaire, 4/6 pour le non alimentaire, ou 1/2 pour l'hygiène), une note invite à interpréter ce panier avec prudence.")
+                div(class = "info-row", "4. PMAS total (d'une commune) : calculé seulement si au moins 12 des 17 articles y sont mesurés localement (règle 3). Les articles restants (jusqu'à 5) sont alors complétés par leur valeur de secours, pour pouvoir quand même calculer un total complet."),
+                div(class = "blue-line"),
+                div(class = "info-row", "5. Moins de 12 articles disponibles localement (dans une commune) : son PMAS total n'est PAS calculé, mais chaque panier est calculé séparément dès que son propre seuil est atteint - panier alimentaire si au moins 6 des 9 produits alimentaires sont disponibles, panier non alimentaire si au moins 4 des 6 produits sont disponibles, panier d'hygiène si les 2 produits sont disponibles (les articles manquants dans un panier calculé sont complétés par leur valeur de secours). Une note l'indique dans la colonne \"Note\"."),
+                div(class = "blue-line"),
+                div(class = "info-row", "6. Entre 12 et 14 articles disponibles (dans une commune) : son PMAS total est calculé, mais si un panier a été calculé avec peu d'articles mesurés localement (moins de 6/9 pour l'alimentaire, 4/6 pour le non alimentaire, ou 1/2 pour l'hygiène), une note invite à interpréter ce panier avec prudence."),
+                div(class = "blue-line"),
+                div(class = "info-row", "7. Ligne nationale calculée sur moins de communes : si un panier n'a pas pu être calculé pour certaines communes (règle 5), la médiane nationale de ce panier (règle 2) est calculée uniquement sur les communes où il a pu l'être - une note l'indique dans la colonne \"Note\" de la ligne \"Ensemble des marchés évalués\".")
               )
             ),
 
@@ -517,6 +523,9 @@ run_analyse_pipeline <- function(clean_data_path,
     clean_data_file = file.path(tmp, "input", "clean_data.xlsx"),
     kobo_tool_file = file.path(tmp, "input", "kobo_tool.xlsx"),
     eur_xrate = "655.95",
+    usd_xrate = "570",   # parite XAF/USD flottante - meme valeur par defaut que le nettoyage (app.R ~L370),
+                         # a mettre a jour periodiquement. Manquait ici (feuilles "meb_analysis"/USD - demande
+                         # utilisateur explicite : MEB en devise locale, EUR ET USD).
     output_dir = paste0(file.path(tmp, "output"), "/"),
     checklist_template = file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME)
   )
@@ -531,7 +540,9 @@ run_analyse_pipeline <- function(clean_data_path,
   log_out <- res$log
 
   out_dir <- file.path(tmp, "output")
-  files <- if (dir.exists(out_dir)) list.files(out_dir, pattern = "_CAR_JMMI_Dataset_Analyse_.*\\.xlsx$", full.names = TRUE) else character()
+  # nom de fichier "REACH_CAR_Analyse_JMMI_<Mois>-<Annee>.xlsx" (voir out_path dans 4_analyse_complete.R,
+  # demande utilisateur - remplace l'ancien "<date>_CAR_JMMI_Dataset_Analyse_<mois>.xlsx")
+  files <- if (dir.exists(out_dir)) list.files(out_dir, pattern = "^REACH_CAR_Analyse_JMMI_.*\\.xlsx$", full.names = TRUE) else character()
   output_file <- if (length(files) > 0) files[1] else NULL
 
   if (ok && is.null(output_file)) {

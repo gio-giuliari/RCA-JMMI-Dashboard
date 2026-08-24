@@ -200,45 +200,71 @@ MEB_TOTAL_MIN_ITEMS <- 12
 MEB_BASKET_MIN_STANDALONE <- c(food = 6, nfi = 4, wash = 2)
 MEB_BASKET_MIN_CAUTION <- c(food = 6, nfi = 4, wash = 1)
 
-# calcule le PMAS (paniers alimentaire/non alimentaire/hygiene + total) a un niveau d'agregation donne
-# (admin3_label, admin2_label, admin1_label, ou une colonne constante pour le niveau national - voir
-# calculate_pmas_national()), en appliquant les regles de suffisance des donnees ci-dessus : chaque
-# article est mesure localement (mediane a ce niveau) si assez d'observations y sont disponibles, sinon
-# impute avec la mediane nationale de cet article ; le total et chaque panier ne sont rendus (sinon NA)
-# que si suffisamment d'articles du panier concerne ont ete mesures localement (pas imputes) - voir les
-# constantes MEB_* ci-dessus. Une colonne "note" explique les cas de donnees insuffisantes ou fragiles.
-calculate_pmas_by_level <- function(data, level_col, min_obs_default = MEB_MIN_OBS_DEFAULT,
+# etape 1 (commune = marche) : mediane de PRIX INDIVIDUELS par article, au niveau du marche - "marche"
+# et "commune" (admin3_label) coincident dans ce dispositif d'enquete, faute d'identifiant de marche
+# distinct (plusieurs detaillants du MEME marche sont enquetes par commune, voir l'echantillonnage
+# decrit dans write_suivi_intro_sheet() de fonctions_nettoyage.R). C'EST LE SEUL ENDROIT ou les prix
+# INDIVIDUELS bruts interviennent - tout le reste (secours d'un marche a court de donnees, niveau
+# national) est construit a partir de medianes deja calculees, jamais recalcule sur les prix individuels
+# (demande utilisateur explicite). Secours sur la MEDIANE DES MEDIANES DE MARCHE (chaque marche compte
+# pour une seule observation dans ce secours, quel que soit son nombre de vendeurs enquetes) si un marche
+# a moins de min_obs prix locaux pour un article donne. Renvoie une valeur ET un indicateur "mesure
+# localement" par (marche, article).
+calculate_market_medians <- function(data, items, min_obs_vec) {
+  vars <- data %>%
+    select(admin3_label, all_of(items)) %>%
+    mutate(across(all_of(items), as.numeric))
+
+  market_median <- vars %>% group_by(admin3_label) %>%
+    summarise(across(all_of(items), ~median(., na.rm = TRUE)), .groups = "drop")
+  market_count <- vars %>% group_by(admin3_label) %>%
+    summarise(across(all_of(items), ~sum(!is.na(.))), .groups = "drop")
+  national_median_of_markets <- market_median %>% summarise(across(all_of(items), ~median(., na.rm = TRUE)))
+
+  market_is_local <- market_count
+  market_value <- market_median
+  for (it in items) {
+    market_is_local[[it]] <- market_count[[it]] >= min_obs_vec[[it]]
+    market_value[[it]] <- if_else(market_is_local[[it]], market_median[[it]], national_median_of_markets[[it]][1])
+  }
+  list(value = market_value, is_local = market_is_local)
+}
+
+# calcule le PMAS (paniers alimentaire/non alimentaire/hygiene + total) au niveau Commune UNIQUEMENT -
+# c'est le SEUL niveau ou les prix INDIVIDUELS bruts interviennent (etape 1, calculate_market_medians()
+# ci-dessus : mediane de marche calculee directement a partir des prix individuels collectes). Le niveau
+# National (calculate_pmas_national() ci-dessous) N'APPELLE PLUS cette fonction avec un niveau
+# d'agregation different pour recomposer un panier a partir de prix par article agreges : il prend
+# directement la MEDIANE des paniers communaux DEJA CALCULES par cette fonction (demande utilisateur
+# explicite : "the original base data needs to be used only to compute the median at the market level ..
+# all else is medians of already calculated medians") - la mediane d'une somme ponderee n'etant pas egale
+# a la somme des medianes, recomposer le panier national a partir de medianes par article donnait un
+# total different de la mediane des totaux communaux, ce qui ne correspondait pas a ce qui etait attendu.
+calculate_pmas_by_level <- function(data, level_col = "admin3_label", min_obs_default = MEB_MIN_OBS_DEFAULT,
                                     min_obs_override = MEB_MIN_OBS_OVERRIDE) {
+  stopifnot(identical(level_col, "admin3_label"))
   items <- names(MEB_WEIGHTS_ALL)
   items <- items[items %in% colnames(data)]
   food_items <- intersect(names(MEB_FOOD_WEIGHTS), items)
   nfi_items <- intersect(names(MEB_NFI_WEIGHTS), items)
   wash_items <- intersect(names(MEB_WASH_WEIGHTS), items)
 
-  vars <- data %>%
-    select(all_of(level_col), all_of(items)) %>%
-    mutate(across(all_of(items), as.numeric))
-
-  national_median <- vars %>% summarise(across(all_of(items), ~median(., na.rm = TRUE)))
-
-  level_median <- vars %>% group_by(across(all_of(level_col))) %>%
-    summarise(across(all_of(items), ~median(., na.rm = TRUE)), .groups = "drop")
-  level_count <- vars %>% group_by(across(all_of(level_col))) %>%
-    summarise(across(all_of(items), ~sum(!is.na(.))), .groups = "drop")
-
   min_obs_vec <- setNames(rep(min_obs_default, length(items)), items)
   for (nm in names(min_obs_override)) if (nm %in% items) min_obs_vec[nm] <- min_obs_override[[nm]]
+
+  mkt <- calculate_market_medians(data, items, min_obs_vec)
+  level_value <- mkt$value
+  level_is_local <- mkt$is_local
+  group_keys <- level_value$admin3_label
 
   w_food <- unlist(MEB_FOOD_WEIGHTS[food_items])
   w_nfi <- unlist(MEB_NFI_WEIGHTS[nfi_items])
   w_wash <- unlist(MEB_WASH_WEIGHTS[wash_items])
 
-  results <- vector("list", nrow(level_median))
-  for (i in seq_len(nrow(level_median))) {
-    is_local <- vapply(items, function(it) isTRUE(level_count[[it]][i] >= min_obs_vec[[it]]), logical(1))
-    value <- vapply(items, function(it) {
-      if (isTRUE(is_local[[it]])) level_median[[it]][i] else national_median[[it]][1]
-    }, numeric(1))
+  results <- vector("list", length(group_keys))
+  for (i in seq_along(group_keys)) {
+    is_local <- vapply(items, function(it) isTRUE(level_is_local[[it]][i]), logical(1))
+    value <- vapply(items, function(it) level_value[[it]][i], numeric(1))
     names(value) <- items
 
     n_food <- sum(is_local[food_items])
@@ -259,7 +285,7 @@ calculate_pmas_by_level <- function(data, level_col, min_obs_default = MEB_MIN_O
     if (!compute_total) {
       note_parts <- c(note_parts, paste0(
         "PMAS total non calculé : données insuffisantes (", n_total, "/", length(items),
-        " articles avec assez de prix locaux, ", MEB_TOTAL_MIN_ITEMS, " requis)."
+        " articles avec assez de prix locaux dans ce marché, ", MEB_TOTAL_MIN_ITEMS, " requis)."
       ))
     } else if (n_total >= MEB_TOTAL_MIN_ITEMS && n_total <= 14) {
       caution <- character(0)
@@ -269,13 +295,13 @@ calculate_pmas_by_level <- function(data, level_col, min_obs_default = MEB_MIN_O
       if (length(caution) > 0) {
         note_parts <- c(note_parts, paste0(
           "À interpréter avec prudence : le panier ", paste(caution, collapse = " et "),
-          " a été calculé avec peu de prix collectés localement."
+          " a été calculé avec peu de prix locaux dans ce marché."
         ))
       }
     }
 
     results[[i]] <- tibble(
-      !!level_col := level_median[[level_col]][i],
+      !!level_col := group_keys[i],
       meb_food = if (compute_food) meb_food_val else NA_real_,
       meb_nfi = if (compute_nfi) meb_nfi_val else NA_real_,
       meb_wash = if (compute_wash) meb_wash_val else NA_real_,
@@ -286,14 +312,40 @@ calculate_pmas_by_level <- function(data, level_col, min_obs_default = MEB_MIN_O
   bind_rows(results)
 }
 
-# meme calcul que calculate_pmas_by_level() mais au niveau national (une seule ligne, tous marches
-# confondus) - reutilise la meme fonction via une colonne de regroupement constante, plutot que de
-# dupliquer la logique de suffisance des donnees dans une fonction separee.
+# niveau National : MEDIANE DES PANIERS COMMUNAUX DEJA CALCULES par calculate_pmas_by_level() (demande
+# utilisateur explicite - voir commentaire au-dessus de calculate_pmas_by_level()), PAS un panier
+# recompose a partir de medianes de prix par article. Chaque panier (alimentaire/non alimentaire/hygiene/
+# total) est medianne INDEPENDAMMENT sur les communes ou il a pu etre calcule (na.rm = TRUE - une commune
+# sans assez d'articles mesures localement pour un panier donne n'entre simplement pas dans la mediane de
+# ce panier, meme si ses autres paniers sont calculables).
 calculate_pmas_national <- function(data, min_obs_default = MEB_MIN_OBS_DEFAULT,
                                     min_obs_override = MEB_MIN_OBS_OVERRIDE) {
-  tmp <- data %>% mutate(.national = "National")
-  calculate_pmas_by_level(tmp, ".national", min_obs_default, min_obs_override) %>%
-    select(-.national)
+  p_commune <- calculate_pmas_by_level(data, "admin3_label", min_obs_default, min_obs_override)
+  n_communes <- nrow(p_commune)
+
+  note_missing <- function(label, n_ok) {
+    if (n_ok < n_communes) {
+      paste0("Panier ", label, " national calculé sur ", n_ok, "/", n_communes,
+            " communes (les autres n'ont pas assez d'articles mesurés localement pour ce panier).")
+    } else {
+      NA_character_
+    }
+  }
+  note_parts <- c(
+    note_missing("alimentaire", sum(!is.na(p_commune$meb_food))),
+    note_missing("non alimentaire", sum(!is.na(p_commune$meb_nfi))),
+    note_missing("hygiène", sum(!is.na(p_commune$meb_wash))),
+    note_missing("total", sum(!is.na(p_commune$meb_total)))
+  )
+  note_parts <- note_parts[!is.na(note_parts)]
+
+  tibble(
+    meb_food = median(p_commune$meb_food, na.rm = TRUE),
+    meb_nfi = median(p_commune$meb_nfi, na.rm = TRUE),
+    meb_wash = median(p_commune$meb_wash, na.rm = TRUE),
+    meb_total = median(p_commune$meb_total, na.rm = TRUE),
+    note = if (length(note_parts) > 0) paste(note_parts, collapse = " ") else NA_character_
+  )
 }
 
 # libelles francais lisibles pour les articles du PMAS/MEB (voir MEB_*_WEIGHTS ci-dessus) - variables
@@ -397,4 +449,22 @@ calculate_meb <- function(data, weights_list) {
     mutate(admin3_label = "National") %>%
     select(admin3_label, MEB)
   bind_rows(res_admin3, res_national)
+}
+
+##############################################################################################################
+# HAUTEUR DE LIGNE DEPENDANTE DU CONTENU (feuille READ_ME)
+##############################################################################################################
+# meme logique que estimate_wrapped_row_height() dans scripts/fonctions_nettoyage.R (NETTOYAGE - remplit
+# la feuille READ_ME initialement) - dupliquee ici cote ANALYSE (pas de sibling fonctions_nettoyage.R a
+# sourcer specifiquement pour cette seule fonction) pour que les lignes ajoutees a la feuille READ_ME
+# depuis 4_analyse_complete.R (description des feuilles d'analyse) aient la meme hauteur dependante du
+# contenu que les lignes deja remplies par le nettoyage, plutot qu'une hauteur fixe qui detonnerait dans
+# le meme tableau.
+estimate_wrapped_row_height <- function(text, col_width_chars, line_height = 15, min_height = 15, padding = 6) {
+  if (is.na(text) || !nzchar(text)) return(min_height)
+  explicit_lines <- max(lengths(gregexpr("\n", text))) + 1
+  chars_per_line <- max(1, floor(col_width_chars))
+  wrapped_lines <- ceiling(nchar(text) / chars_per_line)
+  n_lines <- max(explicit_lines, wrapped_lines)
+  max(min_height, n_lines * line_height + padding)
 }

@@ -1944,11 +1944,30 @@ fill_checklist_data_cleaning <- function(wb){
   set_check(65, "y")   # apercu des feuilles a jour
 }
 
+# estime la hauteur de ligne necessaire pour un texte enveloppe (wrapText) dans une colonne de largeur
+# donnee (en "unites de caractere" Excel, meme echelle que setColWidths()/wb_set_col_widths()) - openxlsx
+# et openxlsx2 n'ont pas de vrai autofit de hauteur de ligne (Excel ne le calcule qu'a l'ouverture
+# manuelle, et seulement si on double-clique la bordure de ligne), d'ou cette approximation par nombre de
+# caracteres : nombre de lignes ~= longueur du texte / caracteres par ligne (tient aussi compte des
+# retours a la ligne explicites "\n" deja presents dans le texte), hauteur = nombre de lignes * hauteur
+# d'une ligne + marge. Demande utilisateur : "make the rows width dependent on the content" (feuille
+# READ_ME) - remplace les hauteurs fixes (45/30) utilisees jusque-la pour toutes les lignes sans
+# distinction.
+estimate_wrapped_row_height <- function(text, col_width_chars, line_height = 15, min_height = 15, padding = 6) {
+  if (is.na(text) || !nzchar(text)) return(min_height)
+  explicit_lines <- max(lengths(gregexpr("\n", text))) + 1
+  chars_per_line <- max(1, floor(col_width_chars))
+  wrapped_lines <- ceiling(nchar(text) / chars_per_line)
+  n_lines <- max(explicit_lines, wrapped_lines)
+  max(min_height, n_lines * line_height + padding)
+}
+
 # Construit la feuille READ_ME avec le meme langage visuel que la propre sortie d'analyse JMMI de
 # REACH (onglet "Lisez_moi" de REACH_CAR_JMMI_Analyse_*.xlsx) : une banniere de titre gris fonce, une
 # banniere de sous-titre gris clair, des libelles de section en gras en colonne A avec des descriptions
 # avec retour a la ligne en colonne B, puis une barre d'en-tete rouge "Contenu" au-dessus d'un index
-# des feuilles a deux colonnes.
+# des feuilles a deux colonnes. Hauteur de chaque ligne dependante de son contenu (voir
+# estimate_wrapped_row_height() ci-dessus), pas une valeur fixe identique pour toutes les lignes.
 write_read_me_sheet <- function(wb, assessment_month_label, assessment_year, collection_start,
                                 collection_end, admin1_covered, admin2_covered, partners_covered,
                                 final_survey_count, sheet_descriptions){
@@ -2001,7 +2020,7 @@ write_read_me_sheet <- function(wb, assessment_month_label, assessment_year, col
     writeData(wb, sheet, s[2], startRow = r, startCol = 2, colNames = FALSE)
     addStyle(wb, sheet, rows = r, cols = 1, style = createStyle(textDecoration = "bold", valign = "top", wrapText = TRUE))
     addStyle(wb, sheet, rows = r, cols = 2, style = createStyle(valign = "top", wrapText = TRUE))
-    setRowHeights(wb, sheet, rows = r, heights = 45)
+    setRowHeights(wb, sheet, rows = r, heights = estimate_wrapped_row_height(s[2], col_width_chars = 100))
     r <- r + 1
   }
 
@@ -2024,7 +2043,7 @@ write_read_me_sheet <- function(wb, assessment_month_label, assessment_year, col
     writeData(wb, sheet, sheet_descriptions[[nm]], startRow = r, startCol = 2, colNames = FALSE)
     addStyle(wb, sheet, rows = r, cols = 1, style = createStyle(textDecoration = "bold", valign = "top"))
     addStyle(wb, sheet, rows = r, cols = 2, style = createStyle(valign = "top", wrapText = TRUE))
-    setRowHeights(wb, sheet, rows = r, heights = 30)
+    setRowHeights(wb, sheet, rows = r, heights = estimate_wrapped_row_height(sheet_descriptions[[nm]], col_width_chars = 100))
     r <- r + 1
   }
 

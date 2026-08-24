@@ -8,7 +8,12 @@ library(openxlsx)
 .build_section_map <- function(survey_df, label_col = "label") {
   result     <- list()
   sect_stack <- character(0)
-  skip_types <- c("begin_repeat", "end_repeat", "note", "calculate",
+  # "calculate" n'est PAS exclu (contrairement a la version d'origine) : les variables de prix/median
+  # de ce rapport (ex. "peanut_price_item") sont de type "calculate" dans l'outil kobo - les exclure
+  # les empechait d'heriter d'une section (elles tombaient toutes dans un groupe "NA" commun a tous
+  # les articles, au lieu de rester rattachees a la section de leur PROPRE article), ce qui cassait a
+  # la fois le regroupement par article et le tri "prix en tete de section" demandes par l'utilisateur.
+  skip_types <- c("begin_repeat", "end_repeat", "note",
                   "hidden", "start", "end", "today", "deviceid", "audit")
   types <- trimws(sub(" .*", "", trimws(survey_df$type)))
   labels <- survey_df[[label_col]]
@@ -72,7 +77,7 @@ format_analysis_results <- function(
     totals        = NULL,
     label_col     = "label",
     accent_colour = "#D2CBB8",
-    header_bg     = "#D42020",
+    header_bg     = "#EE5958",  # meme rouge que la ligne d'en-tete de l'onglet "Score de Fonctionnalité" (voir wb_add_fill(..., "A1:M1", color = "FFEE5958") dans 4_analyse_complete.R)
     sheet_name    = "Résultats"
 ) {
 
