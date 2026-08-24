@@ -178,6 +178,12 @@ PMAS_COST_COLS <- function(p) {
   )
 }
 
+# articles PMAS/MEB attendus mais absents des donnees ce cycle-ci (variable renommee/retiree de l'outil
+# kobo) - calcule ICI (avant le premier appel a calculate_pmas_by_level(), qui l'affiche aussi en
+# cat() console) pour etre reutilise a la fois par la regle 8 de PMAS_EXPLANATION ci-dessous ET par la
+# feuille "meb_composition" plus loin, sans dupliquer le calcul.
+missing_meb_items <- check_meb_items_missing(clean_data)
+
 # niveau Commune (admin3)
 p_commune <- calculate_pmas_by_level(clean_data, "admin3_label") %>%
   filter(admin3_label != "National") %>%
@@ -310,6 +316,19 @@ PMAS_EXPLANATION <- c(
   "6. Entre 12 et 14 articles disponibles (dans une commune) : son PMAS total est calculé, mais si un panier a été calculé avec peu d'articles mesurés localement (moins de 6/9 pour l'alimentaire, 4/6 pour le non alimentaire, ou 1/2 pour l'hygiène), une note invite à interpréter ce panier avec prudence.",
   "7. Ligne nationale calculée sur moins de communes : si un panier n'a pas pu être calculé pour certaines communes (règle 5), la médiane nationale de ce panier (règle 2) est calculée uniquement sur les communes où il a pu l'être - une note l'indique dans la colonne \"Note\" de la ligne \"Ensemble des marchés évalués\"."
 )
+# regle 8 : n'apparait QUE si des articles PMAS/MEB attendus sont absents des donnees ce cycle-ci
+# (missing_meb_items, calcule plus haut avec check_meb_items_missing()) - typiquement une variable
+# renommee/retiree de l'outil kobo. AVANT cette regle, ce cas passait totalement inapercu sur cette
+# feuille : le panier se recalculait avec un article en moins, sans aucune indication ici que quelque
+# chose manquait (demande utilisateur explicite, suite a l'audit de robustesse - voir aussi la feuille
+# "meb_composition", ou l'article manquant est marque en rouge).
+has_missing_meb_items <- length(missing_meb_items) > 0
+if (has_missing_meb_items) {
+  PMAS_EXPLANATION <- c(PMAS_EXPLANATION, paste0(
+    "8. ATTENTION - article(s) manquant(s) ce cycle-ci : ", paste(missing_meb_items, collapse = ", "),
+    " ne correspond(ent) à aucune colonne des données importées (variable probablement renommée ou retirée de l'outil kobo depuis le dernier cycle) et sont donc totalement EXCLU(S) du calcul de tous les paniers ci-dessus, à tous les niveaux - voir la feuille \"meb_composition\" pour le détail (article marqué en rouge)."
+  ))
+}
 explain_title_row <- last_row + 3
 explain_rows <- explain_title_row + seq_along(PMAS_EXPLANATION)
 
@@ -327,6 +346,14 @@ wb_final <- wb_add_font(wb_final, "Coût médian du PMAS", dims = wb_dims(rows =
 wb_final <- wb_add_cell_style(wb_final, "Coût médian du PMAS", dims = wb_dims(rows = explain_rows, cols = 1),
                               horizontal = "left", vertical = "center", wrap_text = "1")
 wb_final <- wb_set_row_heights(wb_final, "Coût médian du PMAS", rows = explain_rows, heights = 30)
+if (has_missing_meb_items) {
+  # regle 8 (la derniere) mise en evidence - fond rose/police rouge gras, memes couleurs que le
+  # marquage "aucune cotation" de "Prix médian par article"/"meb_composition"
+  warn_row <- explain_rows[length(explain_rows)]
+  wb_final <- wb_add_fill(wb_final, "Coût médian du PMAS", dims = wb_dims(rows = warn_row, cols = 1:15), color = wb_color(hex = "FFFFC7CE"))
+  wb_final <- wb_add_font(wb_final, "Coût médian du PMAS", dims = wb_dims(rows = warn_row, cols = 1), name = "Segoe UI", size = 11, bold = TRUE, color = wb_color(hex = "FFFF0000"))
+  wb_final <- wb_set_row_heights(wb_final, "Coût médian du PMAS", rows = warn_row, heights = 45)
+}
 cat("  ..OK (Explication de la méthodologie de suffisance ajoutée)\n")
 
 # --- Evolution des paniers du PMAS -- DESACTIVE TEMPORAIREMENT (demande utilisateur : ne produire que
@@ -1072,15 +1099,21 @@ if (nzchar(CHECKLIST_TEMPLATE_FILE) && file.exists(CHECKLIST_TEMPLATE_FILE)) {
 # toute fin du classeur (voir "meb_composition" en dernier dans desired_order plus bas). Reprend
 # build_meb_composition_table() (scripts/fonctions_analyse.R), deja utilisee par l'ancienne feuille
 # "Composition du PMAS" (desactivee plus tot dans la session) - meme tableau, nom d'onglet different.
+# Colonne "Disponible ce mois-ci" + marquage rouge (demande utilisateur, suite a l'audit de robustesse) :
+# AVANT cet ajout, un article dont la variable avait disparu de l'outil kobo (renommee/retiree)
+# disparaissait SILENCIEUSEMENT du panier calcule (voir garde-fou check_meb_items_missing() dans
+# calculate_pmas_by_level(), scripts/fonctions_analyse.R) tout en restant liste ici comme si de rien
+# n'etait - confirme empiriquement (mediane des medianes ~19% plus basse sur un panier alimentaire sans
+# aucune note nulle part). La feuille reflete maintenant explicitement ce qui manque.
 ################################################################################
 cat("\n- CONSTRUCTION du tableau de reference \"meb_composition\" ...\n")
-composition_pmas <- build_meb_composition_table()
+composition_pmas <- build_meb_composition_table(missing_meb_items)  # missing_meb_items calcule plus haut
 
 wb_final <- wb_add_worksheet(wb_final, "meb_composition")
 wb_final <- wb_add_data(wb_final, "meb_composition", composition_pmas)
-wb_final <- wb_add_font(wb_final, "meb_composition", dims = "A1:D1", bold = TRUE)
-wb_final <- wb_add_fill(wb_final, "meb_composition", dims = "A1:D1", color = wb_color(hex = "FFD9D9D9"))
-wb_final <- wb_set_col_widths(wb_final, "meb_composition", cols = 1:4, widths = c(26, 26, 34, 28))
+wb_final <- wb_add_font(wb_final, "meb_composition", dims = "A1:E1", bold = TRUE)
+wb_final <- wb_add_fill(wb_final, "meb_composition", dims = "A1:E1", color = wb_color(hex = "FFD9D9D9"))
+wb_final <- wb_set_col_widths(wb_final, "meb_composition", cols = 1:5, widths = c(26, 26, 34, 28, 46))
 wb_final <- wb_freeze_pane(wb_final, "meb_composition", firstActiveRow = 2)
 
 # fond de couleur legere par categorie (panier), pour les distinguer visuellement d'un coup d'oeil -
@@ -1091,11 +1124,25 @@ cat_colors <- c("Panier alimentaire" = "FFFCE9D6", "Panier non alimentaire" = "F
 for (cat_name in names(cat_colors)) {
   rows <- which(composition_pmas$Catégorie == cat_name) + 1
   if (length(rows) > 0) {
-    wb_final <- wb_add_fill(wb_final, "meb_composition", dims = wb_dims(rows = rows, cols = 1:4),
+    wb_final <- wb_add_fill(wb_final, "meb_composition", dims = wb_dims(rows = rows, cols = 1:5),
                             color = wb_color(hex = cat_colors[[cat_name]]))
   }
 }
-cat("  ..OK (", nrow(composition_pmas), " articles)\n", sep = "")
+
+# marquage rouge des articles manquants (memes couleurs que le marquage "aucune cotation" de "Prix
+# médian par article") - applique APRES le fond par categorie ci-dessus pour le remplacer sur ces lignes
+missing_rows <- which(composition_pmas$`Disponible ce mois-ci` != "Oui") + 1
+if (length(missing_rows) > 0) {
+  wb_final <- wb_add_fill(wb_final, "meb_composition", dims = wb_dims(rows = missing_rows, cols = 1:5), color = wb_color(hex = "FFFFC7CE"))
+  wb_final <- wb_add_font(wb_final, "meb_composition", dims = wb_dims(rows = missing_rows, cols = 1:5), color = wb_color(hex = "FFFF0000"))
+}
+wb_final <- wb_add_cell_style(wb_final, "meb_composition", dims = wb_dims(rows = 2:(nrow(composition_pmas) + 1), cols = 5), wrap_text = "1", vertical = "center")
+
+if (length(missing_meb_items) > 0) {
+  cat("  ATTENTION : ", length(missing_meb_items), " article(s) PMAS/MEB absent(s) des donnees ce cycle-ci (",
+     paste(missing_meb_items, collapse = ", "), ") - exclu(s) du panier, marque(s) en rouge dans meb_composition\n", sep = "")
+}
+cat("  ..OK (", nrow(composition_pmas), " articles, ", length(missing_meb_items), " absent(s) ce mois-ci)\n", sep = "")
 
 ################################################################################
 # "meb_analysis" / "mfs_analysis" - REPLIQUE DU MODELE EXTERNE REACH (voir 07_sample_output_file.xlsx,

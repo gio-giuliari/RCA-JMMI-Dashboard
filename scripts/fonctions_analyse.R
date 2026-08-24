@@ -178,6 +178,16 @@ MEB_WASH_WEIGHTS <- list(
 )
 MEB_WEIGHTS_ALL <- c(MEB_FOOD_WEIGHTS, MEB_NFI_WEIGHTS, MEB_WASH_WEIGHTS)
 
+# renvoie les variables PMAS/MEB attendues (MEB_WEIGHTS_ALL) mais absentes de `data` - typiquement une
+# variable renommee/retiree de l'outil kobo d'un cycle a l'autre. AVANT ce garde-fou, une telle variable
+# disparaissait silencieusement du panier (calculate_pmas_by_level() filtrait deja par
+# `items %in% colnames(data)`, sans avertissement) : le panier se recalculait avec un article en moins,
+# sans note ni erreur nulle part, et "meb_composition" continuait de lister l'article comme si de rien
+# n'etait - demande utilisateur explicite (suite a l'audit de robustesse) : rendre ce cas visible.
+check_meb_items_missing <- function(data) {
+  setdiff(names(MEB_WEIGHTS_ALL), colnames(data))
+}
+
 ##############################################################################################################
 # SUFFISANCE DES DONNEES POUR LE CALCUL DU PMAS
 ##############################################################################################################
@@ -197,6 +207,12 @@ MEB_MIN_OBS_OVERRIDE <- c(beef_meat_price_item = 1)
 #    un panier est signale "a interpreter avec prudence" s'il n'atteint pas le seuil, plus souple,
 #    MEB_BASKET_MIN_CAUTION.
 MEB_TOTAL_MIN_ITEMS <- 12
+# borne haute de la "zone de prudence" (entre MEB_TOTAL_MIN_ITEMS et cette valeur, le total EST calcule
+# mais avec peu de marge - MEB_BASKET_MIN_CAUTION signale alors les paniers individuels concernes). Etait
+# un "14" ecrit en dur directement dans la condition de calculate_pmas_by_level() ci-dessous - nommee ici
+# pour que le texte explicatif (PMAS_EXPLANATION, 4_analyse_complete.R) puisse la citer dynamiquement au
+# lieu de repeter "14" a la main (demande utilisateur, suite a l'audit de robustesse).
+MEB_TOTAL_CAUTION_MAX_ITEMS <- 14
 MEB_BASKET_MIN_STANDALONE <- c(food = 6, nfi = 4, wash = 2)
 MEB_BASKET_MIN_CAUTION <- c(food = 6, nfi = 4, wash = 1)
 
@@ -244,6 +260,12 @@ calculate_pmas_by_level <- function(data, level_col = "admin3_label", min_obs_de
                                     min_obs_override = MEB_MIN_OBS_OVERRIDE) {
   stopifnot(identical(level_col, "admin3_label"))
   items <- names(MEB_WEIGHTS_ALL)
+  missing_meb_items <- check_meb_items_missing(data)
+  if (length(missing_meb_items) > 0) {
+    cat("  ATTENTION : ", length(missing_meb_items), " article(s) PMAS/MEB absent(s) des donnees (variable(s) ",
+       "introuvable(s) dans clean_data, probablement renommee(s)/retiree(s) de l'outil kobo) - EXCLU(S) DU ",
+       "CALCUL DU PANIER sans imputation possible : ", paste(missing_meb_items, collapse = ", "), "\n", sep = "")
+  }
   items <- items[items %in% colnames(data)]
   food_items <- intersect(names(MEB_FOOD_WEIGHTS), items)
   nfi_items <- intersect(names(MEB_NFI_WEIGHTS), items)
@@ -287,7 +309,7 @@ calculate_pmas_by_level <- function(data, level_col = "admin3_label", min_obs_de
         "PMAS total non calculé : données insuffisantes (", n_total, "/", length(items),
         " articles avec assez de prix locaux dans ce marché, ", MEB_TOTAL_MIN_ITEMS, " requis)."
       ))
-    } else if (n_total >= MEB_TOTAL_MIN_ITEMS && n_total <= 14) {
+    } else if (n_total >= MEB_TOTAL_MIN_ITEMS && n_total <= MEB_TOTAL_CAUTION_MAX_ITEMS) {
       caution <- character(0)
       if (n_food < MEB_BASKET_MIN_CAUTION[["food"]]) caution <- c(caution, "alimentaire")
       if (n_nfi < MEB_BASKET_MIN_CAUTION[["nfi"]]) caution <- c(caution, "non alimentaire")
@@ -374,9 +396,13 @@ MEB_ITEM_LABELS <- c(
 
 # construit le tableau de reference documentant la composition du PMAS/MEB (categorie, article, variable
 # technique, poids applique au prix median de l'article pour obtenir sa contribution au panier) - pour
-# la feuille "Composition du PMAS" (voir 4_analyse_complete.R), afin que quelqu'un qui n'a jamais lu le
-# script comprenne exactement ce qui entre dans chaque panier et avec quel poids.
-build_meb_composition_table <- function() {
+# la feuille "meb_composition" (voir 4_analyse_complete.R), afin que quelqu'un qui n'a jamais lu le
+# script comprenne exactement ce qui entre dans chaque panier et avec quel poids. `missing_items`
+# (voir check_meb_items_missing()) ajoute une colonne "Disponible ce mois-ci" - AVANT cet ajout, un
+# article dont la variable avait disparu de l'outil kobo (renommee/retiree) restait liste ici comme les
+# autres, sans aucune indication qu'il n'est en realite plus applique au panier calcule ce cycle-ci
+# (demande utilisateur explicite, suite a l'audit de robustesse).
+build_meb_composition_table <- function(missing_items = character(0)) {
   build_block <- function(weights, categorie) {
     tibble(
       Catégorie = categorie,
@@ -385,11 +411,15 @@ build_meb_composition_table <- function() {
       `Poids appliqué au prix médian` = round(unlist(weights, use.names = FALSE), 4)
     )
   }
-  bind_rows(
+  out <- bind_rows(
     build_block(MEB_FOOD_WEIGHTS, "Panier alimentaire"),
     build_block(MEB_NFI_WEIGHTS, "Panier non alimentaire"),
     build_block(MEB_WASH_WEIGHTS, "Panier des produits d'hygiène")
   )
+  out$`Disponible ce mois-ci` <- if_else(out$`Variable technique` %in% missing_items,
+                                        "Non - variable absente de l'outil/des données, article exclu du panier",
+                                        "Oui")
+  out
 }
 
 # calcule le PMAS a un niveau d'agregation donne (admin3_label, admin2_label ou admin1_label) : mediane
