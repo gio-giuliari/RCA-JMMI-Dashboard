@@ -19,6 +19,15 @@ library(openxlsx)
   labels <- survey_df[[label_col]]
   names_ <- survey_df$name
 
+  # garde-fou : une paire begin_group/end_group desequilibree dans l'outil kobo n'a jamais fait
+  # planter cette fonction (le "if (length(sect_stack) > 0)" ci-dessous l'empeche deja) mais faisait
+  # silencieusement deriver TOUTES les sections suivantes (chaque question heritant de la mauvaise
+  # section, sans aucune indication nulle part que quelque chose clochait) - demande utilisateur,
+  # suite a l'audit de robustesse. extra_end_groups compte les "end_group" en trop (sans
+  # "begin_group" correspondant) ; sect_stack non vide a la fin de la boucle signale des
+  # "begin_group" jamais refermes.
+  extra_end_groups <- 0
+
   for (i in seq_len(nrow(survey_df))) {
     if (is.na(types[i])) next
     type_base <- types[i]
@@ -31,12 +40,29 @@ library(openxlsx)
       } else if (!is.na(name_val)) name_val else "Section"
       sect_stack <- c(sect_stack, lbl)
     } else if (type_base == "end_group") {
-      if (length(sect_stack) > 0) sect_stack <- sect_stack[-length(sect_stack)]
+      if (length(sect_stack) > 0) {
+        sect_stack <- sect_stack[-length(sect_stack)]
+      } else {
+        extra_end_groups <- extra_end_groups + 1
+      }
     } else if (!is.na(name_val) && !type_base %in% skip_types) {
       if (length(sect_stack) > 0)
         result[[name_val]] <- sect_stack[length(sect_stack)]
     }
   }
+
+  if (extra_end_groups > 0) {
+    warning(extra_end_groups, " 'end_group' sans 'begin_group' correspondant dans l'outil kobo ",
+           "(structure de groupes desequilibree) - les sections attribuees aux questions suivant ",
+           "ce point peuvent etre incorrectes dans la feuille \"Analyse\".", call. = FALSE)
+  }
+  if (length(sect_stack) > 0) {
+    warning(length(sect_stack), " 'begin_group' jamais refermes par un 'end_group' dans l'outil ",
+           "kobo (groupe(s) : ", paste(sect_stack, collapse = ", "), ") - structure de groupes ",
+           "desequilibree, les sections attribuees en fin de feuille \"Analyse\" peuvent etre incorrectes.",
+           call. = FALSE)
+  }
+
   result
 }
 

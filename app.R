@@ -46,6 +46,34 @@ library(srvyr)
 PIPELINE_ROOT <- normalizePath(".")
 CHECKLIST_TEMPLATE_NAME <- "Checklist-Template_Nettoyage-Donnees-Quant_Normes-Min_v1_2_2026-03_FRENCH.xlsx"
 
+## taux de change par defaut (source unique - demande utilisateur, suite a l'audit de robustesse : ces
+## 2 valeurs etaient recopiees independamment a 2 endroits (env_vars du nettoyage ET de l'analyse), sans
+## garantie de rester synchronisees si l'une des deux copies etait mise a jour sans l'autre). XAF/EUR est
+## une parite fixe (ne change jamais) ; XAF/USD flotte sur le marche - DEFAULT_USD_XRATE doit etre mis a
+## jour periodiquement.
+DEFAULT_EUR_XRATE <- "655.95"
+DEFAULT_USD_XRATE <- "570"
+
+## constantes PMAS/MEB partagees avec 4_analyse_complete.R (utilisees uniquement pour generer le texte
+## de l'info-box "Comment le PMAS est calculé" ci-dessous a partir des memes chiffres que le calcul reel,
+## plutot que de les recopier a la main une seconde fois - demande utilisateur, suite a l'audit de
+## robustesse : "17 articles"/"12 des 17" etaient ecrits en dur independamment ici ET dans
+## 4_analyse_complete.R, sans garantie de rester synchronises si un article/seuil PMAS change un jour).
+## source()e au niveau global de l'app (pas seulement copiee dans le dossier temporaire d'une execution,
+## comme pour le reste du pipeline) : sans effet de bord au chargement (uniquement des definitions de
+## constantes/fonctions), et les executions du pipeline restent isolees dans leur propre environnement
+## (voir run_analyse_pipeline()/run_script_inprocess() plus bas), independantes de cette copie globale.
+source(file.path(PIPELINE_ROOT, "scripts", "fonctions_analyse.R"), local = TRUE)
+PMAS_INFO_N_MEB_TOTAL <- length(MEB_WEIGHTS_ALL)
+PMAS_INFO_N_FOOD <- length(MEB_FOOD_WEIGHTS)
+PMAS_INFO_N_NFI <- length(MEB_NFI_WEIGHTS)
+PMAS_INFO_N_WASH <- length(MEB_WASH_WEIGHTS)
+PMAS_INFO_N_EXTRA <- PMAS_INFO_N_MEB_TOTAL - MEB_TOTAL_MIN_ITEMS
+PMAS_INFO_OVERRIDE_LABELS <- unname(MEB_ITEM_LABELS[names(MEB_MIN_OBS_OVERRIDE)])
+PMAS_INFO_OVERRIDE_TEXT <- if (length(MEB_MIN_OBS_OVERRIDE) > 0) {
+  paste0(" - sauf pour ", paste(paste0(PMAS_INFO_OVERRIDE_LABELS, " (seuil réduit à ", MEB_MIN_OBS_OVERRIDE, ")"), collapse = ", "), ".")
+} else ""
+
 #### UI DEFINITION ####
 ui <- shiny::bootstrapPage(
   shinyjs::useShinyjs(),
@@ -185,10 +213,10 @@ ui <- shiny::bootstrapPage(
               div(class = "step-box",
                 div(class = "step-title", "Etape 3 - Comparaison optionnelle au mois précédent"),
                 div(class = "info-row", style = "margin-bottom:10px;",
-                  "Pour comparer le coût des paniers à celui du mois précédent (feuille \"Evolution des paniers du PMAS\") : importez le classeur final nettoyé de ce mois précédent et indiquez son nom. Laissez vide pour ignorer cette comparaison - la feuille sera alors laissée vide."),
+                  "Pour comparer le coût des paniers à celui du mois précédent (feuille \"Evolution des paniers du PMAS\") : importez le classeur d'ANALYSE JMMI de ce mois précédent (le fichier téléchargé à l'Étape 3 - Analyse le mois dernier, PAS le classeur nettoyé) et indiquez son nom. Laissez vide pour ignorer cette comparaison - la feuille sera alors laissée vide."),
                 fluidRow(
                   column(3, textInput("analyse_mois_precedent", "Mois précédent (ex. Juillet)", width = "100%")),
-                  column(6, fileInput("file_analyse_previous", "Classeur final nettoyé du mois précédent (.xlsx, optionnel)", accept = ".xlsx", width = "100%"))
+                  column(6, fileInput("file_analyse_previous", "Classeur d'ANALYSE JMMI du mois précédent (.xlsx, optionnel)", accept = ".xlsx", width = "100%"))
                 )
               ),
 
@@ -202,13 +230,13 @@ ui <- shiny::bootstrapPage(
                 div(class = "blue-line"),
                 div(class = "info-row", "2. National = médiane des paniers communaux déjà calculés : le panier national N'EST PAS recomposé à partir de prix par article agrégés au niveau national, mais correspond à la médiane des paniers (alimentaire, non alimentaire, hygiène, total) déjà calculés pour chaque commune (règle 1) - chaque commune compte pour une seule observation, et chaque panier est médianné indépendamment des trois autres."),
                 div(class = "blue-line"),
-                div(class = "info-row", "3. Suffisance des données (au niveau d'une commune) : un article est considéré \"mesuré localement\" dans un marché s'il y a au moins 3 prix locaux disponibles pour cet article dans ce marché - sauf pour la viande de bœuf, où 1 seul prix suffit. Sinon, la médiane nationale des médianes de marché (voir feuille \"Prix médian par article\") est utilisée comme valeur de secours pour cet article dans ce marché, afin que la commune puisse quand même composer son propre panier."),
+                div(class = "info-row", paste0("3. Suffisance des données (au niveau d'une commune) : un article est considéré \"mesuré localement\" dans un marché s'il y a au moins ", MEB_MIN_OBS_DEFAULT, " prix locaux disponibles pour cet article dans ce marché", PMAS_INFO_OVERRIDE_TEXT, " Sinon, la médiane nationale des médianes de marché (voir feuille \"Prix médian par article\") est utilisée comme valeur de secours pour cet article dans ce marché, afin que la commune puisse quand même composer son propre panier.")),
                 div(class = "blue-line"),
-                div(class = "info-row", "4. PMAS total (d'une commune) : calculé seulement si au moins 12 des 17 articles y sont mesurés localement (règle 3). Les articles restants (jusqu'à 5) sont alors complétés par leur valeur de secours, pour pouvoir quand même calculer un total complet."),
+                div(class = "info-row", paste0("4. PMAS total (d'une commune) : calculé seulement si au moins ", MEB_TOTAL_MIN_ITEMS, " des ", PMAS_INFO_N_MEB_TOTAL, " articles y sont mesurés localement (règle 3). Les articles restants (jusqu'à ", PMAS_INFO_N_EXTRA, ") sont alors complétés par leur valeur de secours, pour pouvoir quand même calculer un total complet.")),
                 div(class = "blue-line"),
-                div(class = "info-row", "5. Moins de 12 articles disponibles localement (dans une commune) : son PMAS total n'est PAS calculé, mais chaque panier est calculé séparément dès que son propre seuil est atteint - panier alimentaire si au moins 6 des 9 produits alimentaires sont disponibles, panier non alimentaire si au moins 4 des 6 produits sont disponibles, panier d'hygiène si les 2 produits sont disponibles (les articles manquants dans un panier calculé sont complétés par leur valeur de secours). Une note l'indique dans la colonne \"Note\"."),
+                div(class = "info-row", paste0("5. Moins de ", MEB_TOTAL_MIN_ITEMS, " articles disponibles localement (dans une commune) : son PMAS total n'est PAS calculé, mais chaque panier est calculé séparément dès que son propre seuil est atteint - panier alimentaire si au moins ", MEB_BASKET_MIN_STANDALONE[["food"]], " des ", PMAS_INFO_N_FOOD, " produits alimentaires sont disponibles, panier non alimentaire si au moins ", MEB_BASKET_MIN_STANDALONE[["nfi"]], " des ", PMAS_INFO_N_NFI, " produits sont disponibles, panier d'hygiène si au moins ", MEB_BASKET_MIN_STANDALONE[["wash"]], " des ", PMAS_INFO_N_WASH, " produits sont disponibles (les articles manquants dans un panier calculé sont complétés par leur valeur de secours). Une note l'indique dans la colonne \"Note\".")),
                 div(class = "blue-line"),
-                div(class = "info-row", "6. Entre 12 et 14 articles disponibles (dans une commune) : son PMAS total est calculé, mais si un panier a été calculé avec peu d'articles mesurés localement (moins de 6/9 pour l'alimentaire, 4/6 pour le non alimentaire, ou 1/2 pour l'hygiène), une note invite à interpréter ce panier avec prudence."),
+                div(class = "info-row", paste0("6. Entre ", MEB_TOTAL_MIN_ITEMS, " et ", MEB_TOTAL_CAUTION_MAX_ITEMS, " articles disponibles (dans une commune) : son PMAS total est calculé, mais si un panier a été calculé avec peu d'articles mesurés localement (moins de ", MEB_BASKET_MIN_CAUTION[["food"]], "/", PMAS_INFO_N_FOOD, " pour l'alimentaire, ", MEB_BASKET_MIN_CAUTION[["nfi"]], "/", PMAS_INFO_N_NFI, " pour le non alimentaire, ou ", MEB_BASKET_MIN_CAUTION[["wash"]], "/", PMAS_INFO_N_WASH, " pour l'hygiène), une note invite à interpréter ce panier avec prudence.")),
                 div(class = "blue-line"),
                 div(class = "info-row", "7. Ligne nationale calculée sur moins de communes : si un panier n'a pas pu être calculé pour certaines communes (règle 5), la médiane nationale de ce panier (règle 2) est calculée uniquement sur les communes où il a pu l'être - une note l'indique dans la colonne \"Note\" de la ligne \"Ensemble des marchés évalués\".")
               )
@@ -366,8 +394,8 @@ run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL, pre
     kobo = file.path(tmp, "ressources", "kobo_tool.xlsx"),
     raw_dataset = file.path(tmp, "input", "raw_data.xlsx"),
     logical_checks = file.path(tmp, "ressources", "check_list_august.xlsx"),
-    eur_xrate = "655.95",
-    usd_xrate = "570",   # parite XAF/USD flottante (contrairement a l'euro) - a mettre a jour periodiquement
+    eur_xrate = DEFAULT_EUR_XRATE,
+    usd_xrate = DEFAULT_USD_XRATE,
     checklist_template = file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME),
     final_workbook_dir = paste0(file.path(tmp, "output", "4_final_donnees_nettoyees"), "/"),
     suivi_final_a_remplir_dir = paste0(file.path(tmp, "output", "2_a_verifier"), "/"),
@@ -522,10 +550,8 @@ run_analyse_pipeline <- function(clean_data_path,
   env_vars <- c(
     clean_data_file = file.path(tmp, "input", "clean_data.xlsx"),
     kobo_tool_file = file.path(tmp, "input", "kobo_tool.xlsx"),
-    eur_xrate = "655.95",
-    usd_xrate = "570",   # parite XAF/USD flottante - meme valeur par defaut que le nettoyage (app.R ~L370),
-                         # a mettre a jour periodiquement. Manquait ici (feuilles "meb_analysis"/USD - demande
-                         # utilisateur explicite : MEB en devise locale, EUR ET USD).
+    eur_xrate = DEFAULT_EUR_XRATE,
+    usd_xrate = DEFAULT_USD_XRATE,
     output_dir = paste0(file.path(tmp, "output"), "/"),
     checklist_template = file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME)
   )

@@ -10,6 +10,10 @@
 #               get_assessment_period_from_data() dans scripts/fonctions_analyse.R). Optionnels :
 #               Sys.getenv("analyse_previous_clean_data_file") + Sys.getenv("analyse_mois_precedent")
 #               (pour la feuille "Evolution des paniers du PMAS" - laissee vide si absents).
+#               ATTENTION : malgre son nom (conserve pour compatibilite avec les variables d'env
+#               existantes), "analyse_previous_clean_data_file" attend un classeur d'ANALYSE JMMI du
+#               mois precedent (sortie de ce meme script - lu via sa feuille "Coût médian du PMAS"),
+#               PAS un classeur "Finale" de nettoyage/clean_data - voir read_prev_pmas() plus bas.
 # SORTIE      : Sys.getenv("output_dir")/REACH_CAR_Analyse_JMMI_<Mois>-<Annee>.xlsx - reprend toutes les
 #               feuilles du classeur de nettoyage importe et y ajoute : Données nettoyées, Coût médian du
 #               PMAS, Evolution des paniers du PMAS, Prix médian par article, Score de Fonctionnalité,
@@ -149,13 +153,6 @@ cat("\n- CALCUL du PMAS (panier minimum) ...\n")
 admin_lookup <- clean_data %>%
   select(admin1_label, admin2_label, admin3_label) %>%
   distinct(admin3_label, .keep_all = TRUE)
-
-# meb_food/meb_nfi/meb_wash/meb_total (calculate_meb(), non filtree par la methodologie de suffisance)
-# restent utilises plus bas pour la feuille "Evolution des paniers du PMAS".
-meb_food <- calculate_meb(clean_data, MEB_FOOD_WEIGHTS) %>% rename(meb_food = MEB)
-meb_nfi <- calculate_meb(clean_data, MEB_NFI_WEIGHTS) %>% rename(meb_nfi = MEB)
-meb_wash <- calculate_meb(clean_data, MEB_WASH_WEIGHTS) %>% rename(meb_wash = MEB)
-meb_total <- calculate_meb(clean_data, MEB_WEIGHTS_ALL) %>% rename(meb_total = MEB)
 
 # --- "Coût médian du PMAS" : niveaux Commune / National uniquement (demande utilisateur - Sous-Préfecture
 # et Préfecture retires, meme structure a 2 niveaux que "Score de Fonctionnalité"), 14 colonnes de couts +
@@ -304,16 +301,30 @@ cat("  ..OK (Coût médian du PMAS : ", nrow(pmas_commune), " communes, 1 ligne 
 # communaux, PAS une mediane de prix par article recomposee au niveau national, demande utilisateur
 # explicite ; regle 7 ajoutee sur le nombre de communes contribuant a la mediane nationale - meme texte
 # que l'info-box du tableau de bord - voir app.R, Étape 3 analyse) - affichee directement DANS le classeur
-# pour que la methodologie soit lisible sans devoir rouvrir le tableau de bord. Constantes
-# correspondantes : MEB_MIN_OBS_DEFAULT/MEB_MIN_OBS_OVERRIDE, MEB_TOTAL_MIN_ITEMS,
-# MEB_BASKET_MIN_STANDALONE, MEB_BASKET_MIN_CAUTION (voir scripts/fonctions_analyse.R).
+# pour que la methodologie soit lisible sans devoir rouvrir le tableau de bord. TOUS les nombres cites
+# (17 articles, 12 requis, seuils par panier, ...) sont calcules ICI a partir des constantes de
+# scripts/fonctions_analyse.R (MEB_MIN_OBS_DEFAULT/MEB_MIN_OBS_OVERRIDE, MEB_TOTAL_MIN_ITEMS,
+# MEB_TOTAL_CAUTION_MAX_ITEMS, MEB_BASKET_MIN_STANDALONE, MEB_BASKET_MIN_CAUTION, MEB_*_WEIGHTS) plutot
+# que ecrits en dur dans le texte - demande utilisateur, suite a l'audit de robustesse : ces nombres
+# etaient auparavant recopies a la main a plusieurs endroits (ici, app.R, et les commentaires de
+# fonctions_analyse.R), sans aucune garantie de rester synchronises si un article ou un seuil change.
+n_meb_total <- length(MEB_WEIGHTS_ALL)
+n_food_items <- length(MEB_FOOD_WEIGHTS)
+n_nfi_items <- length(MEB_NFI_WEIGHTS)
+n_wash_items <- length(MEB_WASH_WEIGHTS)
+n_extra_allowed <- n_meb_total - MEB_TOTAL_MIN_ITEMS
+override_labels <- unname(MEB_ITEM_LABELS[names(MEB_MIN_OBS_OVERRIDE)])
+override_text <- if (length(MEB_MIN_OBS_OVERRIDE) > 0) {
+  paste0(" - sauf pour ", paste(paste0(override_labels, " (seuil réduit à ", MEB_MIN_OBS_OVERRIDE, ")"), collapse = ", "), ".")
+} else ""
+
 PMAS_EXPLANATION <- c(
   "1. Marché = Commune : chaque commune évaluée correspond à un marché (plusieurs vendeurs y sont enquêtés). Le prix médian de chaque article y est calculé directement à partir des prix individuels collectés auprès de ses vendeurs (voir la feuille \"Prix médian par article\") ; chaque commune compose ensuite SON PROPRE panier (alimentaire/non alimentaire/hygiène/total) à partir de ces prix médians et des poids du PMAS (voir la feuille \"meb_composition\").",
   "2. National = médiane des paniers communaux déjà calculés : le panier national N'EST PAS recomposé à partir de prix par article agrégés au niveau national, mais correspond à la médiane des paniers (alimentaire, non alimentaire, hygiène, total) déjà calculés pour chaque commune (règle 1) - chaque commune compte pour une seule observation, et chaque panier est médianné indépendamment des trois autres.",
-  "3. Suffisance des données (au niveau d'une commune) : un article est considéré \"mesuré localement\" dans un marché s'il y a au moins 3 prix locaux disponibles pour cet article dans ce marché - sauf pour la viande de bœuf, où 1 seul prix suffit. Sinon, la médiane nationale des médianes de marché (voir feuille \"Prix médian par article\") est utilisée comme valeur de secours pour cet article dans ce marché, afin que la commune puisse quand même composer son propre panier.",
-  "4. PMAS total (d'une commune) : calculé seulement si au moins 12 des 17 articles y sont mesurés localement (règle 3). Les articles restants (jusqu'à 5) sont alors complétés par leur valeur de secours, pour pouvoir quand même calculer un total complet.",
-  "5. Moins de 12 articles disponibles localement (dans une commune) : son PMAS total n'est PAS calculé, mais chaque panier est calculé séparément dès que son propre seuil est atteint - panier alimentaire si au moins 6 des 9 produits alimentaires sont disponibles, panier non alimentaire si au moins 4 des 6 produits sont disponibles, panier d'hygiène si les 2 produits sont disponibles (les articles manquants dans un panier calculé sont complétés par leur valeur de secours). Une note l'indique dans la colonne \"Note\".",
-  "6. Entre 12 et 14 articles disponibles (dans une commune) : son PMAS total est calculé, mais si un panier a été calculé avec peu d'articles mesurés localement (moins de 6/9 pour l'alimentaire, 4/6 pour le non alimentaire, ou 1/2 pour l'hygiène), une note invite à interpréter ce panier avec prudence.",
+  paste0("3. Suffisance des données (au niveau d'une commune) : un article est considéré \"mesuré localement\" dans un marché s'il y a au moins ", MEB_MIN_OBS_DEFAULT, " prix locaux disponibles pour cet article dans ce marché", override_text, " Sinon, la médiane nationale des médianes de marché (voir feuille \"Prix médian par article\") est utilisée comme valeur de secours pour cet article dans ce marché, afin que la commune puisse quand même composer son propre panier."),
+  paste0("4. PMAS total (d'une commune) : calculé seulement si au moins ", MEB_TOTAL_MIN_ITEMS, " des ", n_meb_total, " articles y sont mesurés localement (règle 3). Les articles restants (jusqu'à ", n_extra_allowed, ") sont alors complétés par leur valeur de secours, pour pouvoir quand même calculer un total complet."),
+  paste0("5. Moins de ", MEB_TOTAL_MIN_ITEMS, " articles disponibles localement (dans une commune) : son PMAS total n'est PAS calculé, mais chaque panier est calculé séparément dès que son propre seuil est atteint - panier alimentaire si au moins ", MEB_BASKET_MIN_STANDALONE[["food"]], " des ", n_food_items, " produits alimentaires sont disponibles, panier non alimentaire si au moins ", MEB_BASKET_MIN_STANDALONE[["nfi"]], " des ", n_nfi_items, " produits sont disponibles, panier d'hygiène si au moins ", MEB_BASKET_MIN_STANDALONE[["wash"]], " des ", n_wash_items, " produits sont disponibles (les articles manquants dans un panier calculé sont complétés par leur valeur de secours). Une note l'indique dans la colonne \"Note\"."),
+  paste0("6. Entre ", MEB_TOTAL_MIN_ITEMS, " et ", MEB_TOTAL_CAUTION_MAX_ITEMS, " articles disponibles (dans une commune) : son PMAS total est calculé, mais si un panier a été calculé avec peu d'articles mesurés localement (moins de ", MEB_BASKET_MIN_CAUTION[["food"]], "/", n_food_items, " pour l'alimentaire, ", MEB_BASKET_MIN_CAUTION[["nfi"]], "/", n_nfi_items, " pour le non alimentaire, ou ", MEB_BASKET_MIN_CAUTION[["wash"]], "/", n_wash_items, " pour l'hygiène), une note invite à interpréter ce panier avec prudence."),
   "7. Ligne nationale calculée sur moins de communes : si un panier n'a pas pu être calculé pour certaines communes (règle 5), la médiane nationale de ce panier (règle 2) est calculée uniquement sur les communes où il a pu l'être - une note l'indique dans la colonne \"Note\" de la ligne \"Ensemble des marchés évalués\"."
 )
 # regle 8 : n'apparait QUE si des articles PMAS/MEB attendus sont absents des donnees ce cycle-ci
@@ -356,73 +367,292 @@ if (has_missing_meb_items) {
 }
 cat("  ..OK (Explication de la méthodologie de suffisance ajoutée)\n")
 
-# --- Evolution des paniers du PMAS -- DESACTIVE TEMPORAIREMENT (demande utilisateur : ne produire que
-# "Coût médian du PMAS" + "Prix médian par article" pour l'instant). Decommenter pour la reactiver
-# (necessite aussi meb_food/meb_nfi/meb_wash/meb_total via calculate_meb(), ci-dessous).
-if (FALSE) {
-meb_food <- calculate_meb(clean_data, MEB_FOOD_WEIGHTS) %>% rename(meb_food = MEB)
-meb_nfi <- calculate_meb(clean_data, MEB_NFI_WEIGHTS) %>% rename(meb_nfi = MEB)
-meb_wash <- calculate_meb(clean_data, MEB_WASH_WEIGHTS) %>% rename(meb_wash = MEB)
-meb_total <- calculate_meb(clean_data, MEB_WEIGHTS_ALL) %>% rename(meb_total = MEB)
+# --- Evolution des paniers du PMAS : niveaux Commune + National uniquement (demande utilisateur
+# explicite : "only keep the commune and national level. This is all that will [be] available from now
+# on" - meme simplification a 2 niveaux que "Coût médian du PMAS"/"Score de Fonctionnalité"). Reactivee
+# (etait desactivee plus tot dans la session) et reconstruite pour utiliser
+# calculate_pmas_by_level()/calculate_pmas_national() - MEME methodologie mediane-des-medianes que "Coût
+# médian du PMAS" (y compris le garde-fou "article manquant", check_meb_items_missing()) - plutot que
+# l'ancien calculate_meb()/calculate_meb_by_level() (seuil de suffisance different, pas de mediane des
+# medianes, pas d'alerte article manquant) utilise avant sa desactivation : reprend p_commune/p_nat DEJA
+# calcules plus haut pour le cycle COURANT (memes valeurs qu'affichees sur "Coût médian du PMAS"), et
+# applique exactement le meme calcul au cycle PRECEDENT si fourni. Mise en forme reprise A L'IDENTIQUE de
+# la version d'origine (demande utilisateur : "exactly as is") - 2 lignes d'en-tete, 3 colonnes par
+# panier (mois precedent / mois courant / evolution), pas de couleur - avec juste la ligne nationale en
+# plus, au meme format que les lignes communales (pas de mise en evidence particuliere, coherent avec le
+# style minimal d'origine de cette feuille).
+# lit les couts PMAS DEJA CALCULES depuis la feuille "Coût médian du PMAS" d'un classeur d'ANALYSE
+# precedent (PAS un classeur "Finale" de nettoyage/clean_data) - demande utilisateur explicite : "you
+# shouldn't need those columns [admin1_label/admin2_label/admin3_label de clean_data], just the data in
+# the evolution des paniers du pmas for the [cycle] ... aka june 2026". Plus robuste dans le temps que de
+# relire des donnees BRUTES et TOUT recalculer : la feuille "Coût médian du PMAS" a un format de sortie
+# STABLE (le notre, invariable d'un cycle a l'autre), independant de la structure de clean_data qui a
+# elle deja change plusieurs fois par le passe (ex. le classeur de reference de juin 2026 utilise encore
+# l'ancien "admin1"/"admin2"/"admin3" sur une seule ligne d'en-tete, incompatible avec le format actuel
+# "admin1_label"/etc. sur 2 lignes) - lire le RESULTAT deja produit par ce meme pipeline evite cette
+# fragilite entierement, plutot que de la contourner cas par cas. Ne garde que les lignes ou "Commune"
+# est renseignee (exclut d'eventuelles lignes Sous-Prefecture/Prefecture d'un ancien classeur a 4
+# niveaux, sans effet sur un classeur au format actuel a 2 niveaux qui n'en a de toute facon pas) ; la
+# ligne nationale est identifiee par son libelle "Ensemble des marchés évalués" dans la colonne
+# "Préfecture" (secours sur la mediane des communes lues si elle est introuvable).
+read_prev_pmas <- function(path) {
+  peek <- read_excel(path, sheet = "Coût médian du PMAS", col_names = FALSE, n_max = 5, col_types = "text")
+  hdr_row <- 1
+  for (r in seq_len(nrow(peek))) {
+    if ("Préfecture" %in% as.character(unlist(peek[r, ]))) { hdr_row <- r; break }
+  }
+  raw <- read_excel(path, sheet = "Coût médian du PMAS", skip = hdr_row - 1, col_types = "text")
+  # normalise les en-tetes (retours a la ligne/espaces multiples a l'interieur d'un nom de colonne) -
+  # constate empiriquement sur le classeur de reference de juin 2026, dont l'en-tete "Coût total des
+  # paniers" contient un retour a la ligne litteral ("Coût total des\npaniers", pour un retour visuel a
+  # l'affichage a l'epoque) qui faisait echouer la correspondance exacte de nom de colonne ci-dessous.
+  colnames(raw) <- trimws(gsub("\\s+", " ", colnames(raw)))
+  cost_cols <- c("Coût du panier alimentaire", "Coût du panier non alimentaire",
+                "Coût du panier des produits d'hygiène", "Coût total des paniers")
+  missing_cols <- setdiff(c("Préfecture", "Commune", cost_cols), colnames(raw))
+  if (length(missing_cols) > 0) {
+    stop("la feuille 'Coût médian du PMAS' de ce classeur ne contient pas les colonnes attendues (",
+        paste(missing_cols, collapse = ", "), ") - ce n'est probablement pas un classeur d'ANALYSE ",
+        "JMMI (sortie de 4_analyse_complete.R).")
+  }
+  raw <- raw %>% mutate(across(all_of(cost_cols), as.numeric))
+
+  # distinct(admin3_label) : un ancien classeur a 4 niveaux (Commune/Sous-Prefecture/Prefecture/
+  # National, avant leur retrait de ce pipeline) peut avoir sa ligne "Sous-Prefecture" repetant a tort
+  # le meme nom de Commune que la ligne Commune correspondante (constate empiriquement sur le classeur
+  # de reference de juin 2026 : sa colonne "Commune" n'est blanchie qu'au niveau Prefecture, pas au
+  # niveau Sous-Prefecture) - garder seulement la 1ere occurrence de chaque commune evite de dupliquer
+  # ces lignes dans la comparaison (la 1ere occurrence est toujours la vraie ligne Commune, puisque ce
+  # niveau est toujours ecrit en premier dans le classeur).
+  commune <- raw %>% filter(!is.na(Commune)) %>%
+    transmute(admin3_label = Commune, meb_food = `Coût du panier alimentaire`,
+             meb_nfi = `Coût du panier non alimentaire`,
+             meb_wash = `Coût du panier des produits d'hygiène`,
+             meb_total = `Coût total des paniers`) %>%
+    distinct(admin3_label, .keep_all = TRUE)
+  national <- raw %>% filter(`Préfecture` == "Ensemble des marchés évalués") %>%
+    transmute(meb_food = `Coût du panier alimentaire`, meb_nfi = `Coût du panier non alimentaire`,
+             meb_wash = `Coût du panier des produits d'hygiène`, meb_total = `Coût total des paniers`)
+  if (nrow(national) == 0) {
+    national <- commune %>%
+      summarise(meb_food = median(meb_food, na.rm = TRUE), meb_nfi = median(meb_nfi, na.rm = TRUE),
+               meb_wash = median(meb_wash, na.rm = TRUE), meb_total = median(meb_total, na.rm = TRUE))
+  }
+  list(commune = commune, national = national[1, ])
+}
 
 if (nzchar(PREVIOUS_INPUT_PATH) && file.exists(PREVIOUS_INPUT_PATH)) {
-  clean_data_prev <- read_excel(PREVIOUS_INPUT_PATH, sheet = "clean_data", skip = 1, col_types = "text")
-  meb_food_prev <- calculate_meb(clean_data_prev, MEB_FOOD_WEIGHTS) %>% rename(prev_food = MEB)
-  meb_nfi_prev <- calculate_meb(clean_data_prev, MEB_NFI_WEIGHTS) %>% rename(prev_nfi = MEB)
-  meb_wash_prev <- calculate_meb(clean_data_prev, MEB_WASH_WEIGHTS) %>% rename(prev_wash = MEB)
-  meb_total_prev <- calculate_meb(clean_data_prev, MEB_WEIGHTS_ALL) %>% rename(prev_total = MEB)
+  # tout le calcul du cycle precedent est protege par tryCatch() : un classeur precedent illisible ou
+  # structurellement incompatible ne doit PAS faire echouer tout le pipeline apres ~9 minutes de calcul
+  # par ailleurs reussi sur le cycle courant (constate empiriquement avec un ancien classeur "Finale" -
+  # crash cryptique "Column admin3_label doesn't exist" au lieu d'un message clair) - en cas d'echec, la
+  # feuille est simplement laissee vide (avec un message explicatif), comme si aucun classeur precedent
+  # n'avait ete fourni.
+  evolution_result <- tryCatch({
+    prev_pmas <- read_prev_pmas(PREVIOUS_INPUT_PATH)
+    p_commune_prev <- prev_pmas$commune
+    p_nat_prev <- prev_pmas$national
 
-  pct_evol <- function(prev, cur) if_else(!is.na(prev) & !is.na(cur) & prev != 0, (cur - prev) / prev, NA_real_)
+    pct_evol <- function(prev, cur) if_else(!is.na(prev) & !is.na(cur) & prev != 0, (cur - prev) / prev, NA_real_)
 
-  evolution_base <- meb_food %>%
-    full_join(meb_nfi, by = "admin3_label") %>%
-    full_join(meb_wash, by = "admin3_label") %>%
-    full_join(meb_total, by = "admin3_label") %>%
-    filter(admin3_label != "National") %>%
-    full_join(meb_food_prev, by = "admin3_label") %>%
-    full_join(meb_nfi_prev, by = "admin3_label") %>%
-    full_join(meb_wash_prev, by = "admin3_label") %>%
-    full_join(meb_total_prev, by = "admin3_label") %>%
-    left_join(admin_lookup, by = "admin3_label")
+    # niveau Commune : jointure a GAUCHE depuis p_commune (cycle COURANT) - demande utilisateur explicite :
+    # "only do the comparison and show for the markets for which we collected data in the latest round, do
+    # not show all other markets" - ne garde donc que les communes evaluees CE cycle-ci ; une commune non
+    # evaluee au cycle precedent (pas de correspondance a droite) affiche simplement des cellules
+    # prev_*/evol_* vides plutot que d'etre exclue. p_commune porte deja admin1_label/admin2_label (joints
+    # plus haut), pas besoin de les rejoindre ici.
+    evolution_commune <- p_commune %>%
+      left_join(p_commune_prev %>% select(admin3_label, prev_food = meb_food, prev_nfi = meb_nfi,
+                                          prev_wash = meb_wash, prev_total = meb_total),
+               by = "admin3_label") %>%
+      transmute(
+        Mois = MOIS, Pays = PAYS,
+        `Préfecture` = admin1_label, `Sous-Préfecture` = admin2_label, Commune = admin3_label,
+        prev_food, meb_food, evol_food = pct_evol(prev_food, meb_food),
+        prev_nfi, meb_nfi, evol_nfi = pct_evol(prev_nfi, meb_nfi),
+        prev_wash, meb_wash, evol_wash = pct_evol(prev_wash, meb_wash),
+        prev_total, meb_total, evol_total = pct_evol(prev_total, meb_total)
+      ) %>%
+      arrange(`Préfecture`, `Sous-Préfecture`, Commune)
 
-  evolution_pmas <- evolution_base %>%
-    transmute(
+    # niveau National : 1 seule ligne - mediane des paniers communaux deja calcules (p_nat/p_nat_prev),
+    # meme convention et meme libelle que "Coût médian du PMAS".
+    evolution_national <- tibble(
       Mois = MOIS, Pays = PAYS,
-      `Préfecture` = admin1_label, `Sous-Préfecture` = admin2_label, Commune = admin3_label,
-      prev_food, meb_food, evol_food = pct_evol(prev_food, meb_food),
-      prev_nfi, meb_nfi, evol_nfi = pct_evol(prev_nfi, meb_nfi),
-      prev_wash, meb_wash, evol_wash = pct_evol(prev_wash, meb_wash),
-      prev_total, meb_total, evol_total = pct_evol(prev_total, meb_total)
-    ) %>%
-    arrange(`Préfecture`, `Sous-Préfecture`, Commune)
+      `Préfecture` = "Ensemble des marchés évalués", `Sous-Préfecture` = NA_character_, Commune = NA_character_,
+      prev_food = p_nat_prev$meb_food, meb_food = p_nat$meb_food,
+      evol_food = pct_evol(p_nat_prev$meb_food, p_nat$meb_food),
+      prev_nfi = p_nat_prev$meb_nfi, meb_nfi = p_nat$meb_nfi,
+      evol_nfi = pct_evol(p_nat_prev$meb_nfi, p_nat$meb_nfi),
+      prev_wash = p_nat_prev$meb_wash, meb_wash = p_nat$meb_wash,
+      evol_wash = pct_evol(p_nat_prev$meb_wash, p_nat$meb_wash),
+      prev_total = p_nat_prev$meb_total, meb_total = p_nat$meb_total,
+      evol_total = pct_evol(p_nat_prev$meb_total, p_nat$meb_total)
+    )
 
-  paniers <- c("Coût du panier alimentaire", "Coût du panier non-alimentaire",
-              "Coût du panier des produits d'hygiène", "Coût total des paniers")
-  header1 <- c("Mois", "Pays", "Préfecture", "Sous-Préfecture", "Commune", rep(paniers, each = 3))
-  header2 <- c("", "", "", "", "", rep(c(if (nzchar(PREVIOUS_MOIS)) PREVIOUS_MOIS else "Mois précédent", MOIS, "Evolution"), times = 4))
-  evol_display <- evolution_pmas %>%
-    transmute(Mois, Pays, `Préfecture`, `Sous-Préfecture`, Commune,
-             across(c(prev_food, meb_food, evol_food, prev_nfi, meb_nfi, evol_nfi,
-                      prev_wash, meb_wash, evol_wash, prev_total, meb_total, evol_total),
-                    ~if_else(is.na(.), "Non évalué", as.character(round(., 4)))))
-  colnames(evol_display) <- paste0("c", seq_len(ncol(evol_display)))
+    evolution_pmas <- bind_rows(evolution_commune, evolution_national)
+
+    # colonnes GAP (NA) inserees entre chaque groupe de panier pour reproduire l'espacement du classeur
+    # de reference REACH_CAR_JMMI_Dataset_Analyse_Juin_Juillet_2026 (colonnes I/M/Q vides entre les
+    # groupes alimentaire/non-alimentaire/hygiene/total) - demande utilisateur explicite : "formatted
+    # exactly like the april july analysis (...) same colors, cell formatting and spaces". Valeurs
+    # numeriques REELLES (pas de texte "Non évalué" comme avant) pour que les formats numeriques Excel
+    # (devise XAF, %) s'appliquent correctement - une commune sans donnee au cycle precedent affiche
+    # simplement des cellules vides (na = "" plus bas), comme dans le classeur de reference.
+    evol_display <- evolution_pmas %>%
+      transmute(
+        c1 = Mois, c2 = Pays, c3 = `Préfecture`, c4 = `Sous-Préfecture`, c5 = Commune,
+        c6 = prev_food, c7 = meb_food, c8 = evol_food, c9 = NA_real_,
+        c10 = prev_nfi, c11 = meb_nfi, c12 = evol_nfi, c13 = NA_real_,
+        c14 = prev_wash, c15 = meb_wash, c16 = evol_wash, c17 = NA_real_,
+        c18 = prev_total, c19 = meb_total, c20 = evol_total
+      )
+
+    prev_label <- if (nzchar(PREVIOUS_MOIS)) PREVIOUS_MOIS else "Mois précédent"
+    paniers <- c("Coût du panier alimentaire", "Coût du panier non-alimentaire",
+                "Coût du panier des produits d'hygiène", "Coût total des paniers")
+    header1 <- rep("", 20)
+    header1[1:5] <- c("Mois", "Pays", "Préfecture", "Sous-Préfecture", "Commune")
+    header2 <- rep("", 20)
+    for (g in seq_along(paniers)) {
+      start_col <- 6 + (g - 1) * 4
+      header1[start_col] <- paniers[g]
+      header2[start_col:(start_col + 2)] <- c(prev_label, MOIS, "Evolution")
+    }
+
+    list(ok = TRUE, header1 = header1, header2 = header2, evol_display = evol_display,
+        n_communes = nrow(evolution_commune))
+  }, error = function(e) list(ok = FALSE, message = conditionMessage(e)))
 
   wb_final <- wb_add_worksheet(wb_final, "Evolution des paniers du PMAS")
-  wb_final <- wb_add_data(wb_final, "Evolution des paniers du PMAS", t(header1), start_row = 1, col_names = FALSE)
-  wb_final <- wb_add_data(wb_final, "Evolution des paniers du PMAS", t(header2), start_row = 2, col_names = FALSE)
-  wb_final <- wb_add_data(wb_final, "Evolution des paniers du PMAS", evol_display, start_row = 3, col_names = FALSE)
-  for (grp in 0:3) {
-    start_col <- 6 + grp * 3
-    wb_final <- wb_merge_cells(wb_final, "Evolution des paniers du PMAS",
-                               dims = wb_dims(rows = 1, cols = start_col:(start_col + 1)))
+  if (evolution_result$ok) {
+    # mise en forme reprise A L'IDENTIQUE du classeur de reference
+    # REACH_CAR_JMMI_Dataset_Analyse_Juin_Juillet_2026 (styles extraits directement du XML OOXML), et
+    # alignee sur les memes constantes que "Coût médian du PMAS" plus haut (FFEE5958/Roboto
+    # Condensed/Segoe UI/BODY_GREY) - demande utilisateur explicite : "formatted exactly like the april
+    # july analysis, with the same colors, cell formatting and spaces". Ligne 1 vide (marge visuelle,
+    # comme le classeur de reference), ligne 2 = en-tete de groupe (fond rouge corail, fusionne sur 3
+    # colonnes par panier), ligne 3 = sous-en-tete de cycle (mois precedent / mois courant / evolution),
+    # donnees a partir de la ligne 4, colonnes I/M/Q vides entre les groupes (memes largeurs que le
+    # classeur de reference).
+    n_data <- nrow(evolution_result$evol_display)
+    last_row <- 3 + n_data
+    national_row_r <- last_row
+    id_block <- 1:5
+    val_blocks <- list(6:8, 10:12, 14:16, 18:20)
+    all_blocks <- c(list(id_block), val_blocks)
+
+    wb_final <- wb_add_data(wb_final, "Evolution des paniers du PMAS", t(evolution_result$header1), start_row = 2, col_names = FALSE)
+    wb_final <- wb_add_data(wb_final, "Evolution des paniers du PMAS", t(evolution_result$header2), start_row = 3, col_names = FALSE)
+    # na = "" : cellules NA (comparaisons impossibles - commune non evaluee au cycle precedent,
+    # Sous-Préfecture/Commune absents sur la ligne nationale) laissees VRAIMENT vides plutot qu'une
+    # erreur Excel "#N/A" litterale (comportement par defaut de wb_add_data(), constate empiriquement).
+    wb_final <- wb_add_data(wb_final, "Evolution des paniers du PMAS", evolution_result$evol_display, start_row = 4, col_names = FALSE, na = "")
+
+    for (blk in val_blocks) {
+      wb_final <- wb_merge_cells(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = 2, cols = blk))
+    }
+
+    # ligne 2 (en-tete de groupe) : fond rouge corail + police blanche (ID = taille 12, paniers = taille
+    # 14, comme le classeur de reference)
+    wb_final <- wb_add_fill(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = 2, cols = id_block), color = wb_color(hex = "FFEE5958"))
+    wb_final <- wb_add_font(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = 2, cols = id_block), name = "Roboto Condensed", size = 12, bold = TRUE, color = wb_color(hex = "FFFFFFFF"))
+    for (blk in val_blocks) {
+      wb_final <- wb_add_fill(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = 2, cols = blk), color = wb_color(hex = "FFEE5958"))
+      wb_final <- wb_add_font(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = 2, cols = blk), name = "Roboto Condensed", size = 14, bold = TRUE, color = wb_color(hex = "FFFFFFFF"))
+    }
+    wb_final <- wb_add_cell_style(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = 2, cols = unlist(all_blocks)), horizontal = "center", vertical = "center", wrap_text = "1")
+    for (blk in all_blocks) {
+      wb_final <- wb_add_border(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = 2, cols = blk),
+                                top_border = "thin", top_color = wb_color(hex = "FFFFFFFF"),
+                                left_border = "thin", left_color = wb_color(hex = "FFFFFFFF"),
+                                right_border = "thin", right_color = wb_color(hex = "FFFFFFFF"),
+                                bottom_border = "thin", bottom_color = wb_color(hex = "FF000000"))
+    }
+
+    # ligne 3 (sous-en-tete de cycle) + corps (lignes 4:last_row) : grille fine noire par bloc (colonnes
+    # I/M/Q laissees entierement vides - ni bordure ni fond, comme le classeur de reference)
+    for (blk in all_blocks) {
+      wb_final <- wb_add_border(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = 3:last_row, cols = blk), inner_hgrid = "thin", inner_vgrid = "thin")
+    }
+    wb_final <- wb_add_font(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = 3, cols = unlist(val_blocks)), name = "Segoe UI", size = 12, bold = TRUE, color = wb_color(hex = BODY_GREY))
+    wb_final <- wb_add_cell_style(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = 3, cols = unlist(all_blocks)), horizontal = "center", vertical = "center")
+
+    body_rows <- setdiff(4:last_row, national_row_r)
+    wb_final <- wb_add_font(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = body_rows, cols = c(id_block, unlist(val_blocks))), name = "Segoe UI", size = 12, color = wb_color(hex = BODY_GREY))
+    wb_final <- wb_add_font(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = body_rows, cols = c(5, 18, 19, 20)), name = "Segoe UI", size = 12, bold = TRUE, color = wb_color(hex = BODY_GREY))
+    wb_final <- wb_add_cell_style(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = body_rows, cols = c(1, 2, unlist(val_blocks))), horizontal = "center", vertical = "center")
+    wb_final <- wb_add_cell_style(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = body_rows, cols = 3:5), horizontal = "left", vertical = "center", indent = 1)
+    wb_final <- wb_add_numfmt(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = body_rows, cols = c(6, 7, 10, 11, 14, 15, 18, 19)), numfmt = "#,##0\\ [$XAF];[Red]#,##0\\ [$XAF]")
+    wb_final <- wb_add_numfmt(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = body_rows, cols = c(8, 12, 16, 20)), numfmt = "0%")
+
+    # ligne nationale : reprend EXACTEMENT le style de la ligne nationale de "Coût médian du PMAS"
+    # (police Roboto Condensed 18 gras, bordure EPAISSE noire en haut ET en bas sur toute la largeur, y
+    # compris les colonnes vides I/M/Q pour un trait continu - update = TRUE pour FUSIONNER cette
+    # bordure epaisse avec la grille fine deja posee plus haut, sans quoi wb_add_border() REMPLACE tout
+    # le style de bordure existant sur les cellules touchees, y compris les bords gauche/droit deja
+    # corrects, comme constate empiriquement plus tot dans cette session) - le libelle fusionne
+    # (Préfecture:Commune) est CENTRE, contrairement aux lignes de donnees ou ces colonnes sont alignees
+    # a gauche.
+    wb_final <- wb_merge_cells(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = national_row_r, cols = 3:5))
+    wb_final <- wb_add_font(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = national_row_r, cols = 1:20), name = "Roboto Condensed", size = 18, bold = TRUE, color = wb_color(hex = BODY_GREY))
+    wb_final <- wb_add_cell_style(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = national_row_r, cols = c(1, 2, unlist(val_blocks))), horizontal = "center", vertical = "center")
+    wb_final <- wb_add_cell_style(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = national_row_r, cols = 3:5), horizontal = "center", vertical = "center")
+    wb_final <- wb_add_numfmt(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = national_row_r, cols = c(6, 7, 10, 11, 14, 15, 18, 19)),
+                              numfmt = "_-* #,##0\\ [$XAF]_-;-* #,##0\\ [$XAF]_-;_-* \"-\"??\\ [$XAF]_-;_-@_-")
+    wb_final <- wb_add_numfmt(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = national_row_r, cols = c(8, 12, 16, 20)), numfmt = "0%")
+    wb_final <- wb_add_border(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = national_row_r, cols = 1:20),
+                              top_border = "thick", bottom_border = "thick", left_border = "none", right_border = "none", update = TRUE)
+
+    # cellules "non evaluable" (comparaison impossible pour cette commune/ce panier) : reprises A
+    # L'IDENTIQUE du classeur de reference REACH_CAR_JMMI_Dataset_Analyse_Juin_Juillet_2026 (styles
+    # extraits directement du XML OOXML) - demande utilisateur explicite : "put a cell like this where
+    # the data is not available and N/A for the evolution column when we cannot compare the 2 months,
+    # essentially the same formatting as in the previous juin juillet file". Colonne mois precedent/mois
+    # courant NA -> texte "Non évalué" (fond gris FFD9D9D9, police italique) ; colonne Evolution NA ->
+    # texte "N/A" (police grasse, aucun fond) - bordures/alignement/format numerique deja poses par les
+    # blocs ci-dessus restent inchanges (Excel les ignore simplement pour du texte). Applique EN DERNIER
+    # pour remplacer, cellule par cellule, le style "normal" (corps ou ligne nationale) deja pose plus
+    # haut - l'ordre des appels determine quel style "gagne" sur une meme cellule.
+    for (blk in val_blocks) {
+      prev_col <- blk[1]; cur_col <- blk[2]; evol_col <- blk[3]
+      prev_na_rows <- 3 + which(is.na(evolution_result$evol_display[[paste0("c", prev_col)]]))
+      cur_na_rows  <- 3 + which(is.na(evolution_result$evol_display[[paste0("c", cur_col)]]))
+      evol_na_rows <- 3 + which(is.na(evolution_result$evol_display[[paste0("c", evol_col)]]))
+      for (r in prev_na_rows) {
+        wb_final <- wb_add_data(wb_final, "Evolution des paniers du PMAS", "Non évalué", start_row = r, start_col = prev_col, col_names = FALSE)
+        wb_final <- wb_add_fill(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = r, cols = prev_col), color = wb_color(hex = "FFD9D9D9"))
+        wb_final <- wb_add_font(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = r, cols = prev_col), name = "Segoe UI", size = 12, italic = TRUE, color = wb_color(hex = BODY_GREY))
+      }
+      for (r in cur_na_rows) {
+        wb_final <- wb_add_data(wb_final, "Evolution des paniers du PMAS", "Non évalué", start_row = r, start_col = cur_col, col_names = FALSE)
+        wb_final <- wb_add_fill(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = r, cols = cur_col), color = wb_color(hex = "FFD9D9D9"))
+        wb_final <- wb_add_font(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = r, cols = cur_col), name = "Segoe UI", size = 12, italic = TRUE, color = wb_color(hex = BODY_GREY))
+      }
+      for (r in evol_na_rows) {
+        wb_final <- wb_add_data(wb_final, "Evolution des paniers du PMAS", "N/A", start_row = r, start_col = evol_col, col_names = FALSE)
+        wb_final <- wb_add_font(wb_final, "Evolution des paniers du PMAS", dims = wb_dims(rows = r, cols = evol_col), name = "Segoe UI", size = 12, bold = TRUE, color = wb_color(hex = BODY_GREY))
+      }
+    }
+
+    wb_final <- wb_set_col_widths(wb_final, "Evolution des paniers du PMAS", cols = 1:20,
+                                  widths = c(11, 9, 21, 21, 28, 20, 20, 14, 4, 18, 18, 15, 4, 19, 18, 15, 4, 18, 18, 15))
+    wb_final <- wb_set_row_heights(wb_final, "Evolution des paniers du PMAS", rows = 2, heights = 40)
+    wb_final <- wb_set_row_heights(wb_final, "Evolution des paniers du PMAS", rows = 3, heights = 22)
+    wb_final <- wb_set_row_heights(wb_final, "Evolution des paniers du PMAS", rows = body_rows, heights = 20)
+    wb_final <- wb_set_row_heights(wb_final, "Evolution des paniers du PMAS", rows = national_row_r, heights = 26)
+    wb_final <- wb_freeze_pane(wb_final, "Evolution des paniers du PMAS", firstActiveRow = 4, firstActiveCol = 6)
+    cat("  ..OK (Evolution des paniers du PMAS :", evolution_result$n_communes, "communes, 1 ligne nationale)\n")
+  } else {
+    wb_final <- wb_add_data(wb_final, "Evolution des paniers du PMAS",
+                            data.frame(paste0("Classeur du mois précédent illisible ou incompatible - feuille laissée vide. Détail : ", evolution_result$message)),
+                            start_row = 1, col_names = FALSE)
+    cat("  ATTENTION : classeur du mois precedent illisible/incompatible (", evolution_result$message,
+       ") - feuille 'Evolution des paniers du PMAS' laissee (quasi) vide.\n", sep = "")
   }
-  wb_final <- wb_add_font(wb_final, "Evolution des paniers du PMAS", dims = "A1:R2", bold = TRUE)
-  wb_final <- wb_freeze_pane(wb_final, "Evolution des paniers du PMAS", firstActiveRow = 3)
-  cat("  ..OK (Evolution des paniers du PMAS :", nrow(evolution_pmas), "communes)\n")
 } else {
   cat("  (pas de classeur du mois precedent fourni - feuille 'Evolution des paniers du PMAS' laissee vide)\n")
   wb_final <- wb_add_worksheet(wb_final, "Evolution des paniers du PMAS")
-}
 }
 
 # --- Prix median par article ---
@@ -732,12 +962,14 @@ nat_low_dims <- sum(
   mfs_national_pillars$mfs_infrastructure_pillar_score < 5
 )
 nat_score <- mfs_national_pillars$mfs_score
+# MFS_LVL_* (scripts/mfs.R, source()e plus haut) : memes 5 chaines EXACTES que calculate_mfs(), plus
+# jamais retapees a la main ici (voir commentaire dans mfs.R).
 nat_functionality <- case_when(
-  is.na(nat_score) ~ "Données insuffisantes",
-  nat_score < 25 | nat_low_dims >= 3 ~ "Problèmes graves",
-  nat_score < 50 | nat_low_dims >= 2 ~ "Mauvaise fonctionnalité",
-  nat_score > 80 & nat_low_dims == 0 ~ "Fonctionnalité complète",
-  TRUE ~ "Fonctionnalité limitée"
+  is.na(nat_score) ~ MFS_LVL_INSUFFICIENT,
+  nat_score < 25 | nat_low_dims >= 3 ~ MFS_LVL_SEVERE,
+  nat_score < 50 | nat_low_dims >= 2 ~ MFS_LVL_POOR,
+  nat_score > 80 & nat_low_dims == 0 ~ MFS_LVL_FULL,
+  TRUE ~ MFS_LVL_LIMITED
 )
 
 score_fonctionnalite_national <- tibble(
@@ -825,14 +1057,14 @@ wb_final <- wb_add_border(wb_final, "Score de Fonctionnalité", dims = wb_dims(r
 # code couleur de la classification (fond plein par categorie, meme palette que le classeur de reference
 # - "Donnees insuffisantes" n'a pas de fond, seulement un texte rouge, contrairement aux 4 autres) -
 # applique APRES le style de corps general ci-dessus pour le remplacer sur cette seule colonne/ces
-# seules lignes.
-MFS_CATEGORY_STYLES <- list(
-  "Problèmes graves" = list(fill = "FFFF0000"),
-  "Mauvaise fonctionnalité" = list(fill = "FFF79646"),
-  "Fonctionnalité limitée" = list(fill = "FFFFFFBF"),
-  "Fonctionnalité complète" = list(fill = "FF249EA0"),
-  "Données insuffisantes" = list(font_color = "FFFF0000")
-)
+# seules lignes. Cle = MFS_LVL_* (scripts/mfs.R), jamais la chaine retapee a la main (voir commentaire
+# dans mfs.R).
+MFS_CATEGORY_STYLES <- list()
+MFS_CATEGORY_STYLES[[MFS_LVL_SEVERE]] <- list(fill = "FFFF0000")
+MFS_CATEGORY_STYLES[[MFS_LVL_POOR]] <- list(fill = "FFF79646")
+MFS_CATEGORY_STYLES[[MFS_LVL_LIMITED]] <- list(fill = "FFFFFFBF")
+MFS_CATEGORY_STYLES[[MFS_LVL_FULL]] <- list(fill = "FF249EA0")
+MFS_CATEGORY_STYLES[[MFS_LVL_INSUFFICIENT]] <- list(font_color = "FFFF0000")
 classif_values <- score_fonctionnalite[[classif_col_name]]
 for (cat_name in names(MFS_CATEGORY_STYLES)) {
   cat_rows <- which(classif_values == cat_name) + 1  # +1 pour la ligne d'en-tete
@@ -886,10 +1118,10 @@ wb_final <- wb_add_font(wb_final, "Score de Fonctionnalité", dims = wb_dims(row
 wb_final <- wb_add_cell_style(wb_final, "Score de Fonctionnalité", dims = wb_dims(rows = legend_header_row, cols = legend_cols), horizontal = "left", vertical = "center", indent = 1)
 
 MFS_LEGEND_ITEMS <- list(
-  list(range = "Score < 25 %", classification = "Problèmes graves", fill = MFS_CATEGORY_STYLES[["Problèmes graves"]]$fill),
-  list(range = "Score entre 26 % et 49 %", classification = "Mauvaise fonctionnalité", fill = MFS_CATEGORY_STYLES[["Mauvaise fonctionnalité"]]$fill),
-  list(range = "Score entre 50 % et 79 %", classification = "Fonctionnalité limitée", fill = MFS_CATEGORY_STYLES[["Fonctionnalité limitée"]]$fill),
-  list(range = "Score ≥ 80 %", classification = "Fonctionnalité complète", fill = MFS_CATEGORY_STYLES[["Fonctionnalité complète"]]$fill)
+  list(range = "Score < 25 %", classification = MFS_LVL_SEVERE, fill = MFS_CATEGORY_STYLES[[MFS_LVL_SEVERE]]$fill),
+  list(range = "Score entre 26 % et 49 %", classification = MFS_LVL_POOR, fill = MFS_CATEGORY_STYLES[[MFS_LVL_POOR]]$fill),
+  list(range = "Score entre 50 % et 79 %", classification = MFS_LVL_LIMITED, fill = MFS_CATEGORY_STYLES[[MFS_LVL_LIMITED]]$fill),
+  list(range = "Score ≥ 80 %", classification = MFS_LVL_FULL, fill = MFS_CATEGORY_STYLES[[MFS_LVL_FULL]]$fill)
 )
 for (i in seq_along(MFS_LEGEND_ITEMS)) {
   item <- MFS_LEGEND_ITEMS[[i]]
@@ -1334,12 +1566,9 @@ mfs_value_cols <- setdiff(colnames(p_commune_mfs), "admin3_label")
 # also there is no need to aggregate it at admin1 admin2 and admin0" (modele externe) ; libelles traduits
 # en anglais pour correspondre exactement au modele (voir la logique originale/en anglais dans
 # calculate_mfs(), scripts/mfs.R : "Categorising outcomes").
-MFS_CLASSIF_EN <- c(
-  "Fonctionnalité complète" = "Full_functionality",
-  "Fonctionnalité limitée" = "Limited_functionality",
-  "Mauvaise fonctionnalité" = "Poor_functionality",
-  "Problèmes graves" = "Severe_issues",
-  "Données insuffisantes" = "Insufficient_data"
+MFS_CLASSIF_EN <- setNames(
+  c("Full_functionality", "Limited_functionality", "Poor_functionality", "Severe_issues", "Insufficient_data"),
+  c(MFS_LVL_FULL, MFS_LVL_LIMITED, MFS_LVL_POOR, MFS_LVL_SEVERE, MFS_LVL_INSUFFICIENT)
 )
 classif_by_admin3 <- mfs_raw %>% ungroup() %>%
   transmute(admin3_label, mfs_functionality_classification = unname(MFS_CLASSIF_EN[functionality]))
@@ -1436,14 +1665,15 @@ if (!is.na(readme_sheet_name)) {
 # ORDRE FINAL DES FEUILLES ET SAUVEGARDE
 ################################################################################
 # couleur des onglets (demande utilisateur) : rouge = feuille de presentation (READ_ME/Lisez_moi, selon la
-# langue du classeur importe) ; vert = feuilles d'ANALYSE ajoutees par ce script (donnees nettoyees + les 4
-# feuilles de resultats "principales" - Coût médian du PMAS, Prix médian par article, Score de
-# Fonctionnalité, Analyse - "Composition du PMAS"/"Evolution des paniers du PMAS" restent grises, non
-# citees par l'utilisateur) ; gris = tout le reste (checklists, feuilles techniques du nettoyage : survey,
-# choices, raw_data, clean_data, cleaning_log, deletion_log, variable_tracker). Rouge/vert reprennent des
-# couleurs deja utilisees ailleurs dans ce classeur (FFEE5958 = rouge corail des en-tetes de tableau,
-# FFBFBFBF = gris des lignes separatrices) pour rester coherent visuellement ; vert = vert standard Office
-# (aucun vert n'est deja utilise ailleurs dans ce classeur).
+# langue du classeur importe) ; vert = feuilles d'ANALYSE ajoutees par ce script (donnees nettoyees + les 5
+# feuilles de resultats "principales" - Coût médian du PMAS, Evolution des paniers du PMAS (demande
+# utilisateur explicite, ajoutee ici - etait grise auparavant), Prix médian par article, Score de
+# Fonctionnalité, Analyse - "Composition du PMAS" reste grise, non citee par l'utilisateur) ; gris = tout
+# le reste (checklists, feuilles techniques du nettoyage : survey, choices, raw_data, clean_data,
+# cleaning_log, deletion_log, variable_tracker). Rouge/vert reprennent des couleurs deja utilisees ailleurs
+# dans ce classeur (FFEE5958 = rouge corail des en-tetes de tableau, FFBFBFBF = gris des lignes
+# separatrices) pour rester coherent visuellement ; vert = vert standard Office (aucun vert n'est deja
+# utilise ailleurs dans ce classeur).
 # IMPORTANT : ceci doit s'executer AVANT wb_set_order() ci-dessous - constate empiriquement, wb_set_order()
 # change l'ordre renvoye par wb_get_sheet_names() mais PAS l'ordre physique de la liste wb$worksheets ;
 # apres un reordonnancement, match(nom, wb_get_sheet_names(wb)) pointe donc vers le mauvais element de
@@ -1454,8 +1684,8 @@ TAB_COLOR_RED   <- "FFEE5958"
 TAB_COLOR_GREEN <- "FF00B050"
 TAB_COLOR_GREY  <- "FFBFBFBF"
 tab_sheets_red   <- c("READ_ME", "Lisez_moi")
-tab_sheets_green <- c("Coût médian du PMAS", "Prix médian par article", "Score de Fonctionnalité",
-                      "Analyse", "Données nettoyées")
+tab_sheets_green <- c("Coût médian du PMAS", "Evolution des paniers du PMAS", "Prix médian par article",
+                      "Score de Fonctionnalité", "Analyse", "Données nettoyées")
 
 set_tab_color <- function(wb, sheet_name, hex) {
   idx <- match(sheet_name, wb_get_sheet_names(wb))

@@ -484,12 +484,28 @@ mfs <- mfs %>%
 # (mfs_score = NA) silently falls into a normal category instead of being flagged.
 mfs <- mfs %>%
   mutate(functionality = case_when(
-    is.na(mfs_score) ~ "Données insuffisantes",
-    mfs_score < 25 | sum_low_dimensions >= 3 ~ "Problèmes graves",
-    mfs_score < 50 | sum_low_dimensions >= 2 ~ "Mauvaise fonctionnalité",
-    mfs_score > 80 & sum_low_dimensions == 0 ~ "Fonctionnalité complète",
-    TRUE ~ "Fonctionnalité limitée"))
+    is.na(mfs_score) ~ MFS_LVL_INSUFFICIENT,
+    mfs_score < 25 | sum_low_dimensions >= 3 ~ MFS_LVL_SEVERE,
+    mfs_score < 50 | sum_low_dimensions >= 2 ~ MFS_LVL_POOR,
+    mfs_score > 80 & sum_low_dimensions == 0 ~ MFS_LVL_FULL,
+    TRUE ~ MFS_LVL_LIMITED))
 
 return(mfs)
 
 }
+
+#############################################################################################################
+# LES 5 CATEGORIES DE CLASSIFICATION MFS (memes chaines EXACTES que celles produites par
+# calculate_mfs() ci-dessus) - definies ICI, au niveau du fichier (pas a l'interieur de la fonction),
+# pour etre reutilisables telles quelles par 4_analyse_complete.R (qui source ce fichier) sans retaper
+# ces chaines une seconde fois - demande utilisateur, suite a l'audit de robustesse : ces 5 chaines
+# etaient auparavant retapees independamment a 4 endroits (le case_when() ci-dessus + 3 endroits dans
+# 4_analyse_complete.R - code couleur, legende, traduction anglaise pour "mfs_analysis"), sans garantie
+# de rester synchronisees si l'une d'elles etait corrigee sans les autres - un tel desaccord fait
+# disparaitre silencieusement la couleur/la traduction de la categorie concernee, sans aucune erreur.
+#############################################################################################################
+MFS_LVL_INSUFFICIENT <- "Données insuffisantes"
+MFS_LVL_SEVERE       <- "Problèmes graves"
+MFS_LVL_POOR         <- "Mauvaise fonctionnalité"
+MFS_LVL_LIMITED      <- "Fonctionnalité limitée"
+MFS_LVL_FULL         <- "Fonctionnalité complète"
