@@ -1,10 +1,12 @@
 ################################################################################
 # JMMI RCA - TABLEAU DE BORD (habillage Shiny du pipeline de nettoyage)
 ################################################################################
-# Ce dossier est AUTONOME (self-contained) : 1_suivi_quotidien.R, 2_nettoyage_final.R, 3_relabel_choices.R,
-# scripts/ et ressources/ sont des COPIES des projets rca_jmmi_cleaning et jmmi_relabelling (sources
-# d'origine, a cote), placees ici pour que ce dossier puisse etre deploye/publie seul (ex. Posit
-# Connect/shinyapps.io), sans dependre des dossiers voisins a l'execution.
+# Ce dossier est AUTONOME (self-contained) : 1_suivi_quotidien.R, 2_nettoyage_final.R, 4_analyse_complete.R,
+# scripts/ et ressources/ sont des COPIES du projet rca_jmmi_cleaning (source d'origine, a cote), placees
+# ici pour que ce dossier puisse etre deploye/publie seul (ex. Posit Connect/shinyapps.io), sans dependre
+# des dossiers voisins a l'execution. scripts/fonctions_relabel.R est une copie de jmmi_relabelling
+# (re-etiquetage des codes de choix, desormais integree automatiquement a l'analyse - voir
+# 4_analyse_complete.R - plutot qu'une etape separee du tableau de bord, demande utilisateur explicite).
 # Si le pipeline de rca_jmmi_cleaning ou l'outil jmmi_relabelling evoluent, il faut recopier ces fichiers
 # ici pour rester a jour (pas de synchronisation automatique).
 # A chaque clic sur "Lancer", l'app copie ces scripts/ressources dans un dossier temporaire isole (propre
@@ -21,7 +23,7 @@ library(shinythemes)
 library(htmltools)
 library(openxlsx)
 # packages utilises par les scripts du pipeline (1_suivi_quotidien.R, 2_nettoyage_final.R,
-# 3_relabel_choices.R, scripts/*.R), maintenant executes dans cette meme session R (voir
+# 4_analyse_complete.R, scripts/*.R), maintenant executes dans cette meme session R (voir
 # run_script_inprocess()) - declares ici pour que la publication (ex. rsconnect::deployApp()) les
 # detecte et les installe sur le serveur.
 library(tidyverse)
@@ -54,25 +56,16 @@ CHECKLIST_TEMPLATE_NAME <- "Checklist-Template_Nettoyage-Donnees-Quant_Normes-Mi
 DEFAULT_EUR_XRATE <- "655.95"
 DEFAULT_USD_XRATE <- "570"
 
-## constantes PMAS/MEB partagees avec 4_analyse_complete.R (utilisees uniquement pour generer le texte
-## de l'info-box "Comment le PMAS est calculé" ci-dessous a partir des memes chiffres que le calcul reel,
-## plutot que de les recopier a la main une seconde fois - demande utilisateur, suite a l'audit de
-## robustesse : "17 articles"/"12 des 17" etaient ecrits en dur independamment ici ET dans
-## 4_analyse_complete.R, sans garantie de rester synchronises si un article/seuil PMAS change un jour).
-## source()e au niveau global de l'app (pas seulement copiee dans le dossier temporaire d'une execution,
-## comme pour le reste du pipeline) : sans effet de bord au chargement (uniquement des definitions de
-## constantes/fonctions), et les executions du pipeline restent isolees dans leur propre environnement
-## (voir run_analyse_pipeline()/run_script_inprocess() plus bas), independantes de cette copie globale.
+## constantes PMAS/MEB partagees avec 4_analyse_complete.R, et generateur du document de methodologie
+## telechargeable (voir scripts/methodology.R - build_methodology_html()) qui a remplace l'ancienne
+## boite d'info "Comment le PMAS est calculé" de l'interface (demande utilisateur explicite : "remove the
+## ui with the meb explanation ... that can be downloaded directly from the dashboard"). source()es au
+## niveau global de l'app (pas seulement copiees dans le dossier temporaire d'une execution, comme pour
+## le reste du pipeline) : sans effet de bord au chargement (uniquement des definitions de constantes/
+## fonctions), et les executions du pipeline restent isolees dans leur propre environnement (voir
+## run_analyse_pipeline()/run_script_inprocess() plus bas), independantes de cette copie globale.
 source(file.path(PIPELINE_ROOT, "scripts", "fonctions_analyse.R"), local = TRUE)
-PMAS_INFO_N_MEB_TOTAL <- length(MEB_WEIGHTS_ALL)
-PMAS_INFO_N_FOOD <- length(MEB_FOOD_WEIGHTS)
-PMAS_INFO_N_NFI <- length(MEB_NFI_WEIGHTS)
-PMAS_INFO_N_WASH <- length(MEB_WASH_WEIGHTS)
-PMAS_INFO_N_EXTRA <- PMAS_INFO_N_MEB_TOTAL - MEB_TOTAL_MIN_ITEMS
-PMAS_INFO_OVERRIDE_LABELS <- unname(MEB_ITEM_LABELS[names(MEB_MIN_OBS_OVERRIDE)])
-PMAS_INFO_OVERRIDE_TEXT <- if (length(MEB_MIN_OBS_OVERRIDE) > 0) {
-  paste0(" - sauf pour ", paste(paste0(PMAS_INFO_OVERRIDE_LABELS, " (seuil réduit à ", MEB_MIN_OBS_OVERRIDE, ")"), collapse = ", "), ".")
-} else ""
+source(file.path(PIPELINE_ROOT, "scripts", "methodology.R"), local = TRUE)
 
 #### UI DEFINITION ####
 ui <- shiny::bootstrapPage(
@@ -117,9 +110,19 @@ ui <- shiny::bootstrapPage(
               div(class = "blue-line"),
               div(class = "info-row", "2. Suivi quotidien / Nettoyage : importez le jeu de donn\u00e9es brutes et l'outil Kobo. Pour le nettoyage, choisissez \"Pour suivi\" la premi\u00e8re fois (cr\u00e9e le classeur \u00e0 faire remplir par l'\u00e9quipe de suivi), puis \"Finale\" une fois ce classeur rempli (\u00e0 importer en plus) pour produire le classeur final."),
               div(class = "blue-line"),
-              div(class = "info-row", "3. \u00c9tiquetage des choix : importez l'outil Kobo et le classeur nettoy\u00e9 (sortie de l'\u00e9tape \"Finale\" ci-dessus) pour remplacer les codes de r\u00e9ponse par leurs libell\u00e9s."),
-              div(class = "blue-line"),
-              div(class = "info-row", "4. Analyse mensuelle : importez le classeur nettoy\u00e9 (sortie de l'\u00e9tape \"Finale\", PAS le classeur \u00e9tiquet\u00e9) pour produire l'analyse compl\u00e8te (statistiques descriptives, PMAS/MEB, Score de Fonctionnalit\u00e9 des March\u00e9s). L'outil Kobo n'est pas \u00e0 r\u00e9importer : il est d\u00e9j\u00e0 inclus dans ce classeur (feuilles \"survey\"/\"choices\").")
+              div(class = "info-row", "3. Analyse mensuelle : importez le classeur nettoy\u00e9 (sortie de l'\u00e9tape \"Finale\") pour produire l'analyse compl\u00e8te (statistiques descriptives, PMAS/MEB, Score de Fonctionnalit\u00e9 des March\u00e9s). L'outil Kobo n'est pas \u00e0 r\u00e9importer : il est d\u00e9j\u00e0 inclus dans ce classeur (feuilles \"survey\"/\"choices\"). La feuille \"Donn\u00e9es nettoy\u00e9es\" du classeur produit a automatiquement ses codes de r\u00e9ponse remplac\u00e9s par leurs libell\u00e9s (plus besoin d'une \u00e9tape d'\u00e9tiquetage s\u00e9par\u00e9e).")
+            ),
+
+            br(),
+
+            ## methodologie complete (PMAS/MEB + SFM/MFS), telechargeable independamment d'un lancement
+            ## du pipeline - remplace l'ancienne boite d'info "Comment le PMAS est calcul\u00e9" (retiree,
+            ## voir Etape 3 - Analyse ci-dessous) : demande utilisateur explicite, document exhaustif
+            ## destine a un public interne ET externe (voir scripts/methodology.R).
+            div(class = "info-box",
+              div(class = "info-title", "M\u00e9thodologie compl\u00e8te (PMAS/MEB et Score de Fonctionnalit\u00e9 des March\u00e9s)"),
+              div(class = "info-row", "Le d\u00e9tail exhaustif de la m\u00e9thodologie utilis\u00e9e par ce pipeline - composition et calcul du PMAS/MEB, calcul du Score de Fonctionnalit\u00e9 des March\u00e9s (SFM/MFS), et les hypoth\u00e8ses retenues pour l'analyse - est disponible en t\u00e9l\u00e9chargement ci-dessous, \u00e0 tout moment (pas besoin de lancer une analyse au pr\u00e9alable)."),
+              downloadButton("download_methodology", "T\u00e9l\u00e9charger la m\u00e9thodologie compl\u00e8te (.html)", class = "run-button")
             ),
 
             br(),
@@ -132,10 +135,9 @@ ui <- shiny::bootstrapPage(
                   choiceNames = list(
                     HTML("Suivi quotidien<span class=\"pill-sub\">(collecte en cours)</span>"),
                     HTML("Nettoyage des donn\u00e9es<span class=\"pill-sub\">(fin de collecte)</span>"),
-                    HTML("Analyse mensuelle<span class=\"pill-sub\">(post-nettoyage)</span>"),
-                    HTML("\u00c9tiquetage des choix<span class=\"pill-sub\">(post-analyse)</span>")
+                    HTML("Analyse mensuelle<span class=\"pill-sub\">(post-nettoyage)</span>")
                   ),
-                  choiceValues = list("suivi", "nettoyage", "analyse", "etiquetage")
+                  choiceValues = list("suivi", "nettoyage", "analyse")
                 )
               ),
               conditionalPanel(
@@ -155,11 +157,11 @@ ui <- shiny::bootstrapPage(
               div(class = "step-title", "Etape 2 - Fichiers"),
               fluidRow(
                 conditionalPanel(
-                  condition = "input.mode_select != 'etiquetage' && input.mode_select != 'analyse'",
+                  condition = "input.mode_select != 'analyse'",
                   column(6, fileInput("file_raw", "Jeu de donn\u00e9es brutes (export Kobo, .xlsx)", accept = ".xlsx", width = "100%"))
                 ),
                 conditionalPanel(
-                  condition = "input.mode_select == 'etiquetage' || input.mode_select == 'analyse'",
+                  condition = "input.mode_select == 'analyse'",
                   column(6, fileInput("file_clean_data", "Base des don\u00e9es nettoy\u00e9e (sortie de l'\u00e9tape \"Finale\", .xlsx)", accept = ".xlsx", width = "100%"))
                 ),
                 conditionalPanel(
@@ -218,27 +220,6 @@ ui <- shiny::bootstrapPage(
                   column(3, textInput("analyse_mois_precedent", "Mois précédent (ex. Juillet)", width = "100%")),
                   column(6, fileInput("file_analyse_previous", "Classeur d'ANALYSE JMMI du mois précédent (.xlsx, optionnel)", accept = ".xlsx", width = "100%"))
                 )
-              ),
-
-              ## explication de la methodologie de suffisance des donnees utilisee pour le calcul du PMAS
-              ## (feuille "Coût médian du PMAS") - constantes correspondantes dans
-              ## scripts/fonctions_analyse.R : MEB_MIN_OBS_DEFAULT/MEB_MIN_OBS_OVERRIDE, MEB_TOTAL_MIN_ITEMS,
-              ## MEB_BASKET_MIN_STANDALONE, MEB_BASKET_MIN_CAUTION.
-              div(class = "info-box",
-                div(class = "info-title", "Comment le PMAS est calculé (feuille \"Coût médian du PMAS\")"),
-                div(class = "info-row", "1. Marché = Commune : chaque commune évaluée correspond à un marché (plusieurs vendeurs y sont enquêtés). Le prix médian de chaque article y est calculé directement à partir des prix individuels collectés auprès de ses vendeurs (voir la feuille \"Prix médian par article\") ; chaque commune compose ensuite SON PROPRE panier (alimentaire/non alimentaire/hygiène/total) à partir de ces prix médians et des poids du PMAS (voir la feuille \"meb_composition\")."),
-                div(class = "blue-line"),
-                div(class = "info-row", "2. National = médiane des paniers communaux déjà calculés : le panier national N'EST PAS recomposé à partir de prix par article agrégés au niveau national, mais correspond à la médiane des paniers (alimentaire, non alimentaire, hygiène, total) déjà calculés pour chaque commune (règle 1) - chaque commune compte pour une seule observation, et chaque panier est médianné indépendamment des trois autres."),
-                div(class = "blue-line"),
-                div(class = "info-row", paste0("3. Suffisance des données (au niveau d'une commune) : un article est considéré \"mesuré localement\" dans un marché s'il y a au moins ", MEB_MIN_OBS_DEFAULT, " prix locaux disponibles pour cet article dans ce marché", PMAS_INFO_OVERRIDE_TEXT, " Sinon, la médiane nationale des médianes de marché (voir feuille \"Prix médian par article\") est utilisée comme valeur de secours pour cet article dans ce marché, afin que la commune puisse quand même composer son propre panier.")),
-                div(class = "blue-line"),
-                div(class = "info-row", paste0("4. PMAS total (d'une commune) : calculé seulement si au moins ", MEB_TOTAL_MIN_ITEMS, " des ", PMAS_INFO_N_MEB_TOTAL, " articles y sont mesurés localement (règle 3). Les articles restants (jusqu'à ", PMAS_INFO_N_EXTRA, ") sont alors complétés par leur valeur de secours, pour pouvoir quand même calculer un total complet.")),
-                div(class = "blue-line"),
-                div(class = "info-row", paste0("5. Moins de ", MEB_TOTAL_MIN_ITEMS, " articles disponibles localement (dans une commune) : son PMAS total n'est PAS calculé, mais chaque panier est calculé séparément dès que son propre seuil est atteint - panier alimentaire si au moins ", MEB_BASKET_MIN_STANDALONE[["food"]], " des ", PMAS_INFO_N_FOOD, " produits alimentaires sont disponibles, panier non alimentaire si au moins ", MEB_BASKET_MIN_STANDALONE[["nfi"]], " des ", PMAS_INFO_N_NFI, " produits sont disponibles, panier d'hygiène si au moins ", MEB_BASKET_MIN_STANDALONE[["wash"]], " des ", PMAS_INFO_N_WASH, " produits sont disponibles (les articles manquants dans un panier calculé sont complétés par leur valeur de secours). Une note l'indique dans la colonne \"Note\".")),
-                div(class = "blue-line"),
-                div(class = "info-row", paste0("6. Entre ", MEB_TOTAL_MIN_ITEMS, " et ", MEB_TOTAL_CAUTION_MAX_ITEMS, " articles disponibles (dans une commune) : son PMAS total est calculé, mais si un panier a été calculé avec peu d'articles mesurés localement (moins de ", MEB_BASKET_MIN_CAUTION[["food"]], "/", PMAS_INFO_N_FOOD, " pour l'alimentaire, ", MEB_BASKET_MIN_CAUTION[["nfi"]], "/", PMAS_INFO_N_NFI, " pour le non alimentaire, ou ", MEB_BASKET_MIN_CAUTION[["wash"]], "/", PMAS_INFO_N_WASH, " pour l'hygiène), une note invite à interpréter ce panier avec prudence.")),
-                div(class = "blue-line"),
-                div(class = "info-row", "7. Ligne nationale calculée sur moins de communes : si un panier n'a pas pu être calculé pour certaines communes (règle 5), la médiane nationale de ce panier (règle 2) est calculée uniquement sur les communes où il a pu l'être - une note l'indique dans la colonne \"Note\" de la ligne \"Ensemble des marchés évalués\".")
               )
             ),
 
@@ -432,63 +413,9 @@ run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL, pre
   list(ok = ok, log = paste(log_out, collapse = "\n"), file = output_file, error_message = res$error_message)
 }
 
-## nom de fichier sur - conserve le nom original importe par l'utilisateur (pour que le fichier de
-## sortie du re-etiquetage suive la meme convention de nommage que le classeur d'entree, voir
-## 3_relabel_choices.R), mais retire tout chemin et tout caractere invalide dans un nom de fichier
-## Windows ; force l'extension .xlsx (seul format accepte par le fileInput).
-safe_input_filename <- function(name) {
-  base <- tools::file_path_sans_ext(basename(name))
-  base <- gsub('[\\\\/:*?"<>|]', "_", base)
-  if (!nzchar(base)) base <- "clean_data"
-  paste0(base, ".xlsx")
-}
-
 ## meme principe que run_pipeline() (dossier temporaire isole, execution EN PROCESSUS - voir
-## run_script_inprocess()), mais pour l'outil de re-etiquetage des choix (independant du pipeline de
-## nettoyage lui-meme : prend en entree le classeur nettoye deja produit, pas les donnees brutes).
-run_relabel_pipeline <- function(clean_data_path, clean_data_name, kobo_path) {
-
-  tmp <- file.path(tempdir(), paste0("jmmi_relabel_", gsub("[^0-9]", "", format(Sys.time(), "%Y%m%d%H%M%OS3"))))
-  dir.create(file.path(tmp, "input"), recursive = TRUE)
-  dir.create(file.path(tmp, "scripts"), recursive = TRUE)
-  dir.create(file.path(tmp, "output"), recursive = TRUE)
-
-  file.copy(file.path(PIPELINE_ROOT, "scripts", "fonctions_relabel.R"),
-            file.path(tmp, "scripts", "fonctions_relabel.R"), overwrite = TRUE)
-  file.copy(file.path(PIPELINE_ROOT, "3_relabel_choices.R"),
-            file.path(tmp, "3_relabel_choices.R"), overwrite = TRUE)
-
-  # nom d'entree preserve (voir safe_input_filename) - 3_relabel_choices.R nomme sa sortie
-  # "<nom du fichier d'entree>_final.xlsx", donc conserver le nom original ici est ce qui garantit
-  # que le fichier telecharge suit la convention de nommage standard au lieu d'un nom fixe generique.
-  clean_data_filename <- safe_input_filename(clean_data_name)
-  file.copy(clean_data_path, file.path(tmp, "input", clean_data_filename), overwrite = TRUE)
-  file.copy(kobo_path, file.path(tmp, "input", "kobo_tool.xlsx"), overwrite = TRUE)
-
-  env_vars <- c(
-    kobo_tool_file = file.path(tmp, "input", "kobo_tool.xlsx"),
-    clean_data_file = file.path(tmp, "input", clean_data_filename),
-    output_dir = paste0(file.path(tmp, "output"), "/")
-  )
-
-  res <- run_script_inprocess(file.path(tmp, "3_relabel_choices.R"), wd = tmp, env_vars = env_vars)
-  ok <- res$ok
-  log_out <- res$log
-
-  out_dir <- file.path(tmp, "output")
-  files <- if (dir.exists(out_dir)) list.files(out_dir, pattern = "_final\\.xlsx$", full.names = TRUE) else character()
-  output_file <- if (length(files) > 0) files[1] else NULL
-
-  if (ok && is.null(output_file)) {
-    ok <- FALSE
-    log_out <- c(log_out, "Le script s'est terminé sans erreur mais aucun fichier de sortie attendu n'a été trouvé.")
-  }
-
-  list(ok = ok, log = paste(log_out, collapse = "\n"), file = output_file, error_message = res$error_message)
-}
-
-## meme principe que run_relabel_pipeline() (dossier temporaire isole, execution EN PROCESSUS), pour
-## l'analyse mensuelle complete (descriptive + PMAS/MEB + Score de Fonctionnalite) : prend en entree le
+## run_script_inprocess()), pour l'analyse mensuelle complete (descriptive + PMAS/MEB + Score de
+## Fonctionnalite) : prend en entree le
 ## classeur final deja produit par le nettoyage (pas les donnees brutes). L'annee/le mois du cycle sont
 ## detectes automatiquement depuis ce classeur (voir get_assessment_period_from_data() dans
 ## scripts/fonctions_analyse.R), pas passes ici. `previous_clean_path`/`previous_mois` sont optionnels
@@ -514,6 +441,10 @@ run_analyse_pipeline <- function(clean_data_path,
   # mise en forme de la feuille "Analyse" (voir format_analysis_results() dans 4_analyse_complete.R)
   file.copy(file.path(PIPELINE_ROOT, "scripts", "format_results.R"),
             file.path(tmp, "scripts", "format_results.R"), overwrite = TRUE)
+  # relabel_choices()/relabel_multiple_choice_subcolumn_labels() - re-etiquetage automatique de "Données
+  # nettoyées" (voir 4_analyse_complete.R) - demande utilisateur explicite : plus une etape separee.
+  file.copy(file.path(PIPELINE_ROOT, "scripts", "fonctions_relabel.R"),
+            file.path(tmp, "scripts", "fonctions_relabel.R"), overwrite = TRUE)
   file.copy(file.path(PIPELINE_ROOT, "4_analyse_complete.R"),
             file.path(tmp, "4_analyse_complete.R"), overwrite = TRUE)
   # modele de checklist (voir CHECKLIST_TEMPLATE_NAME) : sa feuille "CHECKLIST_Data_Cleaning" vierge est
@@ -526,6 +457,7 @@ run_analyse_pipeline <- function(clean_data_path,
     file.path(tmp, "scripts", "fonctions_analyse.R"),
     file.path(tmp, "scripts", "mfs.R"),
     file.path(tmp, "scripts", "format_results.R"),
+    file.path(tmp, "scripts", "fonctions_relabel.R"),
     file.path(tmp, "4_analyse_complete.R"),
     file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME)
   )
@@ -603,13 +535,6 @@ ERROR_PATTERNS <- list(
     titre = "Doublons dans le recodage des réponses \"autre\"",
     message = "La feuille reponses_autres du classeur rempli contient plusieurs recodages différents pour la même réponse \"autre\" de la même enquête.",
     action = "Dans la feuille reponses_autres, vérifiez qu'une seule case (VRAI / EXISTANT / INVALIDE) a été remplie par ligne, puis réimportez le classeur corrigé."
-  ),
-  list(
-    pattern = "Aucune feuille 'raw_data' ou 'clean_data' trouvee",
-    kinds = "etiquetage",
-    titre = "Mauvais fichier importé pour l'étiquetage",
-    message = "Le classeur importé ne contient ni feuille raw_data ni clean_data. Cette étape attend en entrée le classeur FINAL produit par le nettoyage (\"Nettoyage des données\" > \"Finale\"), pas les données brutes ni un autre type de fichier.",
-    action = "Importez le fichier REACH_CAR_Dataset_JMMI_<Mois>-<Année>.xlsx téléchargé à la fin de l'étape \"Finale\" du nettoyage, puis relancez l'étiquetage."
   ),
   list(
     pattern = "Le journal de nettoyage additionnel contient des erreurs",
@@ -706,7 +631,6 @@ diagnose_error <- function(kind, log_text, error_message = NULL) {
       suivi = "Causes fréquentes : le fichier de données brutes ne correspond pas à l'outil Kobo importé, ou la colonne \"date\" est manquante/mal renseignée.",
       pour_suivi = "Causes fréquentes : le fichier de données brutes ne correspond pas à l'outil Kobo importé, ou un fichier n'est pas au format .xlsx attendu.",
       finale = "Causes fréquentes : le classeur \"suivi à vérifier\" ne correspond pas au même fichier de données brutes que la première exécution, ou une ligne du classeur rempli est incohérente (voir le détail ci-dessous pour l'identifiant d'enquête concerné).",
-      etiquetage = "Causes fréquentes : le classeur nettoyé importé ne provient pas de l'étape \"Finale\" du nettoyage, ou l'outil Kobo importé ne correspond pas à ces données.",
       analyse = "Causes fréquentes : le classeur nettoyé importé ne provient pas de l'étape \"Finale\" du nettoyage (il doit contenir les feuilles \"survey\"/\"choices\"), ou le classeur du mois précédent (optionnel) n'est pas le bon fichier.",
       "Causes fréquentes : fichiers importés au mauvais endroit, fichier non conforme au format .xlsx, ou incohérence entre les données et l'outil Kobo."
     )
@@ -737,7 +661,7 @@ server <- function(input, output, session) {
       return(invisible())
     }
 
-    if (input$mode_select %in% c("etiquetage", "analyse")) {
+    if (input$mode_select == "analyse") {
       if (is.null(input$file_clean_data)) {
         showNotification("Veuillez importer le classeur nettoy\u00e9.", type = "error")
         return(invisible())
@@ -747,7 +671,7 @@ server <- function(input, output, session) {
       return(invisible())
     }
 
-    kind <- if (input$mode_select == "suivi") "suivi" else if (input$mode_select %in% c("etiquetage", "analyse")) input$mode_select else input$submode_select
+    kind <- if (input$mode_select == "suivi") "suivi" else if (input$mode_select == "analyse") "analyse" else input$submode_select
     if (input$mode_select == "nettoyage" && is.null(input$submode_select)) {
       showNotification("Veuillez choisir 'Pour suivi' ou 'Finale'.", type = "error")
       return(invisible())
@@ -765,13 +689,7 @@ server <- function(input, output, session) {
     result$file <- NULL
 
     res <- tryCatch(
-      if (identical(kind, "etiquetage")) {
-        run_relabel_pipeline(
-          clean_data_path = input$file_clean_data$datapath,
-          clean_data_name = input$file_clean_data$name,
-          kobo_path = input$file_kobo$datapath
-        )
-      } else if (identical(kind, "analyse")) {
+      if (identical(kind, "analyse")) {
         run_analyse_pipeline(
           clean_data_path = input$file_clean_data$datapath,
           previous_clean_path = if (!is.null(input$file_analyse_previous)) input$file_analyse_previous$datapath else NULL,
@@ -839,6 +757,15 @@ server <- function(input, output, session) {
   output$download <- downloadHandler(
     filename = function() basename(result$file),
     content = function(file) file.copy(result$file, file, overwrite = TRUE)
+  )
+
+  # document de methodologie (PMAS/MEB + SFM/MFS) : disponible independamment d'un lancement du
+  # pipeline (pas de dependance a `result`) - genere a la demande via build_methodology_html()
+  # (scripts/methodology.R), pour que les chiffres PMAS/MEB affiches ne puissent jamais diverger des
+  # constantes reellement utilisees par le calcul au moment du telechargement.
+  output$download_methodology <- downloadHandler(
+    filename = function() "Methodologie_JMMI_RCA_PMAS-MFS.html",
+    content = function(file) writeLines(build_methodology_html(), file, useBytes = TRUE)
   )
 }
 

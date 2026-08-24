@@ -43,6 +43,11 @@ options(dplyr.summarise.inform = FALSE)
 source("scripts/fonctions_analyse.R", local = TRUE)
 source("scripts/mfs.R", local = TRUE)
 source("scripts/format_results.R", local = TRUE)
+# relabel_choices()/relabel_multiple_choice_subcolumn_labels() - re-etiquetage automatique des codes de
+# choix dans "Données nettoyées" (voir plus bas) - demande utilisateur explicite : "the etiquetage de
+# choix does not deserve a step, it needs to be automatically included in the analysis calculations"
+# (etait auparavant une etape separee du tableau de bord - voir app.R, mode retire).
+source("scripts/fonctions_relabel.R", local = TRUE)
 
 ################################################################################
 # PARAMETRES (variables d'environnement - voir run_analyse_pipeline() dans app.R)
@@ -123,15 +128,39 @@ ANNEE <- period$assessment_year
 cat("  periode detectee automatiquement :", MOIS, ANNEE, "\n")
 
 ################################################################################
-# "DONNEES NETTOYEES" -- copie EXACTE (mise en forme comprise) de la feuille "clean_data" du classeur de
-# nettoyage importe (demande utilisateur : "just copy the clean_data sheet in all its formatting, dont
-# change it"), avec les colonnes de prix individuels/taux de change masquees (deja affichees ailleurs -
-# "Prix médian par article" pour les prix, taux de change non pertinents pour une lecture generale des
-# donnees). Remplace l'ancienne version basee sur build_labeled_dataset() (jeu de donnees RE-etiquete,
-# donc PAS une copie fidele de clean_data) utilisee plus tot dans la session.
+# "DONNEES NETTOYEES" -- copie de la feuille "clean_data" du classeur de nettoyage importe (meme mise en
+# forme, memes colonnes, meme ordre - demande utilisateur : "just copy the clean_data sheet in all its
+# formatting, dont change it"), avec (1) les colonnes de prix individuels/taux de change masquees (deja
+# affichees ailleurs - "Prix médian par article" pour les prix, taux de change non pertinents pour une
+# lecture generale des donnees) et (2) les CODES des questions a choix (select_one/select_multiple)
+# remplaces par leur LIBELLE lisible - demande utilisateur explicite : "the etiquetage de choix does not
+# deserve a step, it needs to be automatically included in the analysis calculations ... include this
+# step in the analysis script" (etait auparavant une etape manuelle separee du tableau de bord -
+# "Étiquetage des choix" / 3_relabel_choices.R -, desormais retiree, voir app.R). Seules les VALEURS sont
+# modifiees (jamais les noms de colonnes/variables, ni clean_data/raw_data qui restent au format
+# technique brut necessaire aux calculs de ce script et a la tracabilite) - voir
+# scripts/fonctions_relabel.R (fonctions generiques, deja utilisees et testees pour ce meme usage).
 ################################################################################
 cat("\n- COPIE de la feuille \"clean_data\" (Données nettoyées) ...\n")
 wb_final <- wb_clone_worksheet(wb_final, old = "clean_data", new = "Données nettoyées", from = wb_final)
+
+cat("  ..re-etiquetage automatique des codes de choix ...\n")
+label_row_clean_data <- suppressMessages(
+  read_excel(INPUT_PATH, sheet = "clean_data", range = readxl::cell_rows(1), col_names = FALSE, col_types = "text")
+)
+label_row_clean_data <- as.character(unlist(label_row_clean_data[1, ], use.names = FALSE))
+relabelled_nettoyees <- relabel_choices(clean_data, kobo_survey, kobo_choices, verbose = FALSE)
+new_label_row_nettoyees <- relabel_multiple_choice_subcolumn_labels(
+  colnames(clean_data), label_row_clean_data, kobo_survey, kobo_choices
+)
+# na = "" : de nombreuses cellules de clean_data sont vides par conception (questions non applicables/
+# sautees selon la logique de l'outil kobo - "relevant") - sans ce parametre, wb_add_data() les affiche
+# comme une erreur Excel "#N/A" litterale plutot que des cellules vides (comportement par defaut, constate
+# empiriquement plus tot dans cette session), ce qui rend "Données nettoyées" illisible - demande
+# utilisateur explicite suite a ce constat.
+wb_final <- wb_add_data(wb_final, "Données nettoyées", t(new_label_row_nettoyees), start_row = 1, col_names = FALSE, na = "")
+wb_final <- wb_add_data(wb_final, "Données nettoyées", relabelled_nettoyees, start_row = 2, col_names = TRUE, na = "")
+
 # colonnes masquees (PAS supprimees - openxlsx2 ne permet pas de decaler des colonnes sans risquer de
 # corrompre fusions/styles/formules de la feuille clonee) : prix individuels par article
 # (*_price_item), taux de change EUR (*_eur_xrate_official) et USD (*_usd_xrate_official). Les noms de
