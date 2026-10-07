@@ -168,6 +168,17 @@ ui <- shiny::bootstrapPage(
                   condition = "input.mode_select != 'analyse'",
                   column(6, fileInput("file_kobo", "Outil Kobo (survey/choices, .xlsx)", accept = ".xlsx", width = "100%"))
                 )
+              ),
+              conditionalPanel(
+                condition = "input.mode_select == 'nettoyage' && input.submode_select == 'finale'",
+                fluidRow(
+                  column(4,
+                    numericInput("usd_xrate_input", "Taux de change USD/XAF actuel",
+                                 value = as.numeric(DEFAULT_USD_XRATE), min = 1, step = 0.01, width = "100%"),
+                    div(class = "info-row", style = "margin-top:-8px;",
+                      "Le XAF/EUR est une parite fixe (jamais saisie ici) ; le XAF/USD flotte sur le marche - verifiez le taux du jour avant de lancer.")
+                  )
+                )
               )
             ),
 
@@ -314,7 +325,8 @@ run_script_inprocess <- function(script_path, wd, env_vars = character(0)) {
 ## construit et lance une execution isolee du pipeline dans un sous-dossier temporaire, EN PROCESSUS
 ## (voir run_script_inprocess()). Fonction de haut niveau (hors server()) pour pouvoir etre testee
 ## independamment de l'app.
-run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL, previous_review_path = NULL) {
+run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL, previous_review_path = NULL,
+                         usd_xrate = DEFAULT_USD_XRATE) {
 
   script_basename <- if (kind == "suivi") "1_suivi_quotidien" else "2_nettoyage_final"
 
@@ -376,7 +388,7 @@ run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL, pre
     raw_dataset = file.path(tmp, "input", "raw_data.xlsx"),
     logical_checks = file.path(tmp, "ressources", "check_list_august.xlsx"),
     eur_xrate = DEFAULT_EUR_XRATE,
-    usd_xrate = DEFAULT_USD_XRATE,
+    usd_xrate = as.character(usd_xrate),
     checklist_template = file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME),
     final_workbook_dir = paste0(file.path(tmp, "output", "4_final_donnees_nettoyees"), "/"),
     suivi_final_a_remplir_dir = paste0(file.path(tmp, "output", "2_a_verifier"), "/"),
@@ -425,7 +437,8 @@ run_pipeline <- function(kind, raw_data_path, kobo_path, filled_path = NULL, pre
 ## scripts/fonctions_nettoyage.R) - on les reextrait ci-dessous plutot que de redemander a l'utilisateur
 ## un fichier qu'il a deja fourni a l'etape de nettoyage.
 run_analyse_pipeline <- function(clean_data_path,
-                                 previous_clean_path = NULL, previous_mois = NULL) {
+                                 previous_clean_path = NULL, previous_mois = NULL,
+                                 usd_xrate = DEFAULT_USD_XRATE) {
 
   tmp <- file.path(tempdir(), paste0("jmmi_analyse_", gsub("[^0-9]", "", format(Sys.time(), "%Y%m%d%H%M%OS3"))))
   dir.create(file.path(tmp, "input"), recursive = TRUE)
@@ -483,7 +496,7 @@ run_analyse_pipeline <- function(clean_data_path,
     clean_data_file = file.path(tmp, "input", "clean_data.xlsx"),
     kobo_tool_file = file.path(tmp, "input", "kobo_tool.xlsx"),
     eur_xrate = DEFAULT_EUR_XRATE,
-    usd_xrate = DEFAULT_USD_XRATE,
+    usd_xrate = as.character(usd_xrate),
     output_dir = paste0(file.path(tmp, "output"), "/"),
     checklist_template = file.path(tmp, "ressources", CHECKLIST_TEMPLATE_NAME)
   )
@@ -661,6 +674,12 @@ server <- function(input, output, session) {
       return(invisible())
     }
 
+    if (input$mode_select == "nettoyage" && identical(input$submode_select, "finale") &&
+       (is.null(input$usd_xrate_input) || is.na(input$usd_xrate_input) || input$usd_xrate_input <= 0)) {
+      showNotification("Veuillez indiquer le taux de change USD/XAF actuel.", type = "error")
+      return(invisible())
+    }
+
     if (input$mode_select == "analyse") {
       if (is.null(input$file_clean_data)) {
         showNotification("Veuillez importer le classeur nettoy\u00e9.", type = "error")
@@ -693,7 +712,8 @@ server <- function(input, output, session) {
         run_analyse_pipeline(
           clean_data_path = input$file_clean_data$datapath,
           previous_clean_path = if (!is.null(input$file_analyse_previous)) input$file_analyse_previous$datapath else NULL,
-          previous_mois = if (nzchar(trimws(input$analyse_mois_precedent))) trimws(input$analyse_mois_precedent) else NULL
+          previous_mois = if (nzchar(trimws(input$analyse_mois_precedent))) trimws(input$analyse_mois_precedent) else NULL,
+          usd_xrate = DEFAULT_USD_XRATE
         )
       } else {
         run_pipeline(kind,
@@ -701,7 +721,8 @@ server <- function(input, output, session) {
           kobo_path = input$file_kobo$datapath,
           filled_path = if (identical(kind, "finale")) input$file_filled$datapath else NULL,
           previous_review_path = if (identical(kind, "pour_suivi") && isTRUE(input$has_previous_review) &&
-                                     !is.null(input$file_previous_review)) input$file_previous_review$datapath else NULL
+                                     !is.null(input$file_previous_review)) input$file_previous_review$datapath else NULL,
+          usd_xrate = if (identical(kind, "finale")) input$usd_xrate_input else DEFAULT_USD_XRATE
         )
       },
       error = function(e) list(ok = FALSE, log = paste("Erreur :", conditionMessage(e)), file = NULL,

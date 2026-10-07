@@ -398,67 +398,13 @@ df_outliers <- log_outliers$cleaning_log %>%
   # ne pas signaler deux fois le meme champ (deja signale ci-dessus par les verifications logiques)
   anti_join(df_principal, by = c("uuid", "question"))
 
-# 3bis) valeurs statistiquement aberrantes - VERSION ROBUSTE (mediane + MAD), en complement de
-#       check_outliers() ci-dessus, meme perimetre (<item>_price_item uniquement). Constat utilisateur :
-#       plusieurs valeurs 416667 sur salt_price_item n'etaient PAS signalees par check_outliers() malgre
-#       leur caractere manifestement aberrant. check_outliers() (cleaningtools) compare chaque valeur a
-#       la MOYENNE +/- 3 ECARTS-TYPES de la colonne (sur la valeur brute ET sur sa version log-
-#       transformee) : des qu'il y a PLUSIEURS valeurs aberrantes SIMILAIRES en meme temps (pas une
-#       seule), chacune fait grimper a la fois la moyenne et (bien plus fortement, l'ecart-type etant tres
-#       sensible aux valeurs extremes - il eleve chaque ecart au carre) l'ecart-type de la colonne -
-#       au-dela d'un certain nombre de valeurs aberrantes similaires (~10% de l'echantillon dans nos
-#       tests de simulation), le seuil "moyenne +/- 3 ecarts-types" devient lui-meme si large qu'il finit
-#       par TOUTES les contenir, y compris des valeurs manifestement fausses (effet de "masquage" -
-#       limite connue de la famille moyenne/ecart-type pour la detection d'aberrations, pas un bug
-#       specifique a check_outliers()). La mediane et la MAD (Median Absolute Deviation, equivalent
-#       robuste de l'ecart-type) ne bougent quasiment pas tant que MOINS DE LA MOITIE des valeurs sont
-#       aberrantes - elles ne se laissent donc pas masquer de la meme facon, et rattrapent precisement ce
-#       cas de figure sans remplacer la verification existante (les deux tournent en parallele).
-MAD_OUTLIER_THRESHOLD <- 3
-robust_outlier_rows <- list()
-for (item in items_list) {
-  x <- suppressWarnings(as.numeric(raw_data_all[[item]]))
-  valid <- !is.na(x)
-  if (sum(valid) < 3) next
-  med <- median(x[valid])
-  mad_val <- mad(x[valid])
-  # mad_val == 0 (plus de la moitie des valeurs valides sont IDENTIQUES a la mediane) : "ecart > seuil *
-  # 0" flaguerait alors TOUTE valeur simplement differente de la mediane, y compris des valeurs tout a
-  # fait normales - dans ce cas (peu probable pour un prix, mais possible sur un tres petit echantillon
-  # ou beaucoup de reponses identiques), ce complement est ignore pour cette colonne, la verification
-  # standard (check_outliers() ci-dessus) restant seule active.
-  if (mad_val == 0) next
-  is_outlier <- valid & abs(x - med) > MAD_OUTLIER_THRESHOLD * mad_val
-  if (!any(is_outlier)) next
-  robust_outlier_rows[[item]] <- data.frame(
-    uuid = raw_data_all$uuid[is_outlier],
-    question = item,
-    old_value = as.character(x[is_outlier]),
-    issue = "Valeur statistiquement aberrante (ecart a la mediane - verification robuste, complementaire)",
-    check_id = "outlier_robuste", check_binding = NA_character_,
-    change_type = NA_character_, new_value = NA_character_,
-    stringsAsFactors = FALSE
-  )
-}
-df_outliers_robust <- if (length(robust_outlier_rows) > 0) {
-  bind_rows(robust_outlier_rows) %>%
-    left_join(raw_data_all %>% select(uuid, all_of(INFO_COLS)), by = "uuid") %>%
-    # ne pas signaler deux fois le meme champ (deja signale par les verifications logiques, ou par
-    # check_outliers() ci-dessus quand les deux methodes s'accordent)
-    anti_join(df_principal, by = c("uuid", "question")) %>%
-    anti_join(df_outliers, by = c("uuid", "question"))
-} else {
-  df_outliers[0, ]
-}
-df_outliers <- bind_rows(df_outliers, df_outliers_robust)
-
-# 3ter) prix depassant un seuil ABSOLU (demande utilisateur : un prix normalise superieur a 20000 ne
-#       devrait JAMAIS arriver, quelle que soit la population de l'echantillon). Contrairement aux deux
-#       verifications precedentes (3/3bis, toutes deux RELATIVES a la distribution de l'echantillon -
-#       moyenne/ecart-type ou mediane/MAD), ce seuil ne depend d'aucune distribution : il signale donc
-#       meme le cas extreme ou une colonne entiere serait anormalement elevee (ex. erreur d'unite
-#       systematique sur tout un article), qu'aucune methode statistique relative ne peut par nature
-#       detecter (rien n'y "depasse" le reste de sa propre colonne).
+# 3bis) prix depassant un seuil ABSOLU (demande utilisateur : un prix normalise superieur a 20000 ne
+#       devrait JAMAIS arriver, quelle que soit la population de l'echantillon). Contrairement a la
+#       verification precedente (3, RELATIVE a la distribution de l'echantillon - moyenne/ecart-type),
+#       ce seuil ne depend d'aucune distribution : il signale donc meme le cas extreme ou une colonne
+#       entiere serait anormalement elevee (ex. erreur d'unite systematique sur tout un article), que la
+#       methode statistique relative ne peut par nature detecter (rien n'y "depasse" le reste de sa
+#       propre colonne).
 PRICE_ABSOLUTE_THRESHOLD <- 20000
 absolute_outlier_rows <- list()
 for (item in items_list) {
@@ -478,8 +424,8 @@ for (item in items_list) {
 df_outliers_absolute <- if (length(absolute_outlier_rows) > 0) {
   bind_rows(absolute_outlier_rows) %>%
     left_join(raw_data_all %>% select(uuid, all_of(INFO_COLS)), by = "uuid") %>%
-    # ne pas signaler deux fois le meme champ (deja signale par les verifications logiques, ou par l'une
-    # des deux verifications statistiques ci-dessus quand elles s'accordent)
+    # ne pas signaler deux fois le meme champ (deja signale par les verifications logiques, ou par
+    # check_outliers() ci-dessus quand les deux methodes s'accordent)
     anti_join(df_principal, by = c("uuid", "question")) %>%
     anti_join(df_outliers, by = c("uuid", "question"))
 } else {
@@ -993,6 +939,26 @@ if (length(additional_deletion_logs) > 0) {
 
 filled <- filled %>% arrange(uuid, question)
 
+# les champs "calculate" (<item>_price_item et leurs eventuels intermediaires, voir
+# get_calculated_price_field_names()/recompute_price_items() dans fonctions_nettoyage.R) sont EXCLUS
+# ici, AVANT filled_field_level/filled_no_deletion (utilisees respectivement par create_clean_data() et
+# par la construction de combined_cleaning_log plus bas) : recompute_price_items() les ecrase de toute
+# facon INCONDITIONNELLEMENT plus bas a partir des vraies variables source - appliquer/journaliser quand
+# meme une correction saisie dessus (Verification_prix) n'aurait aucun effet final ET creerait une
+# entree de journal en double avec celle du recalcul automatique (bug constate : review_cleaning()
+# signalait a la fois "Changes were not applied" et "Duplicated entry" pour le meme champ). La note
+# ajoutee sur la cellule "Que faire ?" de ces lignes (voir write_review_sheet()) previent deja l'equipe
+# de suivi que toute saisie ici sera ignoree - ce filtre en est la contrepartie cote traitement. Filtre
+# applique sur `filled` (pas seulement filled_field_level) pour que combined_cleaning_log (base sur
+# filled_no_deletion, derivee separement de `filled`) herite lui aussi de cette exclusion.
+calculated_price_fields <- get_calculated_price_field_names(kobo_survey)
+n_ignored_calculated <- sum(filled$question %in% calculated_price_fields, na.rm = TRUE)
+if (n_ignored_calculated > 0) {
+  cat("--> ", n_ignored_calculated, " signalement(s) sur un champ calcule automatiquement (prix) ignore(s) ",
+     "- ces champs sont de toute facon recalcules plus bas (voir journal de nettoyage).\n", sep = "")
+}
+filled <- filled %>% filter(is.na(question) | !question %in% calculated_price_fields)
+
 # les lignes "toute l'enquete" (quasi-doublon, valeurs manquantes) ont variable/question = NA - elles
 # ne correspondent a aucune colonne reelle du jeu de donnees et ne peuvent donc etre appliquees qu'au
 # niveau de l'enquete entiere (via l'action "Supprimer toute l'enquete"), jamais au niveau d'un champ.
@@ -1228,7 +1194,13 @@ clean_data <- clean_data %>% filter(!uuid %in% deletion_log$uuid)
 # la collecte, jamais mis a jour. Voir recompute_price_items() dans scripts/fonctions_nettoyage.R ; les
 # colonnes EUR/USD ci-dessous (RECALCUL DES PRIX EN EUROS/DOLLARS) en dependent directement, et se
 # recalculent donc elles aussi correctement a partir des valeurs a jour.
-clean_data <- recompute_price_items(clean_data, kobo_survey)
+price_recompute <- recompute_price_items(clean_data, kobo_survey)
+clean_data <- price_recompute$df
+price_recalc_log <- price_recompute$log
+if (nrow(price_recalc_log) > 0) {
+  cat("--> ", nrow(price_recalc_log), " valeur(s) de champ \"calculate\" (prix) recalculee(s) suite a une ",
+     "correction d'une variable source (journalisee(s)).\n", sep = "")
+}
 
 # "days_db" (stock_duration_days/restock_wait_days, voir plus haut) : une valeur de 0 jour est
 # techniquement valide (rupture immediate) mais ambigue une fois combinee au calcul RE.1 du SFM
@@ -1275,7 +1247,8 @@ combined_cleaning_log <- filled_no_deletion %>%
   rbind(cleaning_log_other) %>%
   rbind(ras_log %>% select(uuid, question, change_type, old_value, new_value, issue, comment)) %>%
   rbind(days_zero_log %>% select(uuid, question, change_type, old_value, new_value, issue, comment)) %>%
-  rbind(missing_constraint_log %>% select(uuid, question, change_type, old_value, new_value, issue, comment))
+  rbind(missing_constraint_log %>% select(uuid, question, change_type, old_value, new_value, issue, comment)) %>%
+  rbind(price_recalc_log %>% select(uuid, question, change_type, old_value, new_value, issue, comment))
 
 # raw_data_all_avant_ras (avant la conversion automatique RAS -> vide, voir plus haut) est utilise ici,
 # pas raw_data_all (deja converti) - sinon review_cleaning() ne verrait plus aucune difference pour ces
@@ -1430,7 +1403,10 @@ orphan_empty_cols <- orphan_empty_cols[vapply(orphan_empty_cols, function(v) {
 
 rename_index_to_id <- "_index" %in% colnames(clean_data_updated) && !"id" %in% colnames(clean_data_updated)
 remove_cols <- c(
-  intersect(colnames(clean_data_updated), filter(kobo_survey, type %in% c("note", "geopoint", "decimal"))$name),
+  # "decimal" retire de cette liste (bug constate) : les 2 seuls champs "decimal" de l'outil sont
+  # vegetable_oil_other_unit_item/water_other_unit_item - precisement les champs "_other_unit_item" que
+  # le commentaire ci-dessous dit explicitement CONSERVER, silencieusement retires malgre cette intention.
+  intersect(colnames(clean_data_updated), filter(kobo_survey, type %in% c("note", "geopoint"))$name),
   "audit", "audit_URL", "deviceid", "enum_id", "shop_name", "organisation_name_label",
   # consent est CONSERVEE dans clean_data (demande utilisateur) - ne plus la retirer ici.
   # admin1_label/admin2_label/admin3_label sont conservees (nouvelles variables, consignees dans
@@ -1488,7 +1464,8 @@ cleaning_log_final <- combined_cleaning_log %>%
   left_join(enum_lookup, by = "uuid") %>%
   rename(variable = question, feedback = comment) %>%
   select(uuid, variable, issue, feedback, change_type, old_value, new_value, enum_id) %>%
-  distinct()
+  distinct() %>%
+  arrange(uuid, variable)
 
 justify_removed_variable <- function(v) {
   case_when(

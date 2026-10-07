@@ -206,9 +206,59 @@ recompute_calculate_field <- function(df, formula) {
 # df. 2 passes (les intermediaires d'abord, puis les _price_item qui peuvent les referencer) plutot
 # qu'une resolution generale de dependances - aucun intermediaire observe dans l'outil ne depend d'un
 # AUTRE intermediaire, une chaine a 2 niveaux suffit pour la structure actuelle.
+empty_price_recalc_log <- function() {
+  tibble(uuid = character(0), question = character(0), old_value = character(0),
+        change_type = character(0), new_value = character(0), issue = character(0),
+        comment = character(0))
+}
+
+# journalise une valeur recalculee par rapport a sa valeur precedente dans `df` (avant ecrasement) -
+# meme logique de comparaison que le recalcul des prix en euros (2_nettoyage_final.R, RECALCUL DES PRIX
+# EN EUROS) : NA != NA doit valoir FALSE (sinon chaque champ jamais renseigne serait signale comme
+# "change"), une seule ligne par uuid dont la valeur a reellement change.
+log_recalculated_field <- function(df, fname, new_vals) {
+  old_vals_chr <- as.character(df[[fname]])
+  new_vals_chr <- as.character(new_vals)
+  changed <- (is.na(old_vals_chr) != is.na(new_vals_chr)) |
+    (!is.na(old_vals_chr) & !is.na(new_vals_chr) & old_vals_chr != new_vals_chr)
+  if (!any(changed)) return(empty_price_recalc_log())
+  tibble(uuid = df$uuid[changed], question = fname, old_value = old_vals_chr[changed],
+        change_type = "change_response", new_value = new_vals_chr[changed],
+        issue = paste0("Valeur recalculee automatiquement (champ \"calculate\" de l'outil kobo) suite a ",
+                       "une modification d'une des variables source du bloc prix"),
+        comment = NA_character_)
+}
+
+# Noms des champs "calculate" (<item>_price_item + leurs eventuels intermediaires <item>_<taille>_
+# price_unit_item) qui seront de toute facon ECRASES par recompute_price_items(), quelle que soit la
+# valeur presente dans clean_data au moment ou elle tourne - utilisee a la fois par
+# recompute_price_items() (ci-dessous) et par 2_nettoyage_final.R pour exclure ces champs de
+# create_clean_data() (une correction saisie dessus dans Verification_prix n'a de toute facon aucun
+# effet final, et l'appliquer quand meme produirait une entree de journal en double avec le recalcul
+# automatique - voir price_recalc_log). Factorisee ici pour que les deux endroits identifient
+# exactement le meme ensemble de champs, sans jamais diverger.
+get_calculated_price_field_names <- function(kobo_survey) {
+  price_item_fields <- kobo_survey %>% filter(type == "calculate", str_ends(name, "_price_item"))
+  if (nrow(price_item_fields) == 0) return(character(0))
+  referenced_vars <- str_remove_all(unlist(str_extract_all(price_item_fields$calculation, "\\$\\{\\w+\\}")), "[${}]")
+  intermediate_fields <- kobo_survey %>%
+    filter(type == "calculate", name %in% referenced_vars, str_ends(name, "_price_unit_item"))
+  unique(c(price_item_fields$name, intermediate_fields$name))
+}
+
+# Renvoie list(df=..., log=...) plutot que seulement df (voir ci-dessus) : le recalcul des champs
+# "calculate" ecrase directement clean_data sans jamais passer par create_clean_data()/le journal de
+# nettoyage habituel - sans ce journal separe, une correction sur une variable source (ex.
+# water_price_unit_item) qui fait changer <item>_price_item n'apparaissait nulle part dans le classeur
+# final, alors que la valeur avait bel et bien change (bug constate : "Entry missing in cleaning log"
+# signale par review_cleaning() a l'execution). Fusionne dans combined_cleaning_log par l'appelant (voir
+# 2_nettoyage_final.R) - qui exclut par ailleurs ces memes champs de create_clean_data() (voir
+# get_calculated_price_field_names() ci-dessus), donc `df` arrive ici SANS correction manuelle
+# deja appliquee sur ces champs : old_value ci-dessous est donc toujours la vraie valeur brute/precedente,
+# jamais une valeur intermediaire tapee par l'equipe de suivi et vouee a etre ecrasee.
 recompute_price_items <- function(df, kobo_survey) {
   price_item_fields <- kobo_survey %>% filter(type == "calculate", str_ends(name, "_price_item"))
-  if (nrow(price_item_fields) == 0) return(df)
+  if (nrow(price_item_fields) == 0) return(list(df = df, log = empty_price_recalc_log()))
 
   referenced_vars <- str_remove_all(unlist(str_extract_all(price_item_fields$calculation, "\\$\\{\\w+\\}")), "[${}]")
   intermediate_fields <- kobo_survey %>%
@@ -221,15 +271,28 @@ recompute_price_items <- function(df, kobo_survey) {
   numeric_vars <- setdiff(unique(c(referenced_vars, intermediate_referenced, price_item_fields$name)), select_one_vars)
   for (v in intersect(numeric_vars, colnames(df))) df[[v]] <- suppressWarnings(as.numeric(df[[v]]))
 
+  recalc_log <- empty_price_recalc_log()
   for (i in seq_len(nrow(intermediate_fields))) {
     fname <- intermediate_fields$name[i]
-    if (fname %in% colnames(df)) df[[fname]] <- recompute_calculate_field(df, intermediate_fields$calculation[i])
+    if (fname %in% colnames(df)) {
+      # arrondi a l'entier le plus proche (demande utilisateur) - certaines formules kobo (ex. "egg")
+      # n'appellent pas round() elles-memes, produisant des decimales sur ~16 chiffres qui n'ont aucun
+      # sens pour un prix/une quantite en CFA ; applique ici plutot que de dependre de chaque formule
+      # kobo pour rester correct meme sur un article dont la formule oublierait round().
+      new_vals <- round(recompute_calculate_field(df, intermediate_fields$calculation[i]))
+      recalc_log <- bind_rows(recalc_log, log_recalculated_field(df, fname, new_vals))
+      df[[fname]] <- new_vals
+    }
   }
   for (i in seq_len(nrow(price_item_fields))) {
     fname <- price_item_fields$name[i]
-    if (fname %in% colnames(df)) df[[fname]] <- recompute_calculate_field(df, price_item_fields$calculation[i])
+    if (fname %in% colnames(df)) {
+      new_vals <- round(recompute_calculate_field(df, price_item_fields$calculation[i]))
+      recalc_log <- bind_rows(recalc_log, log_recalculated_field(df, fname, new_vals))
+      df[[fname]] <- new_vals
+    }
   }
-  df
+  list(df = df, log = recalc_log)
 }
 
 #############################################################################################################
@@ -598,15 +661,40 @@ queue_list_validation <- function(sheet_name, col, rows, list_range) {
   invisible(NULL)
 }
 
+# PENDING_COMMENTS (voir queue_comment() ci-dessous) suit exactement le meme principe que
+# PENDING_DROPDOWN_VALIDATIONS : les notes Excel (write_review_sheet(), lignes is_calculated_field) NE
+# SONT PAS ecrites directement via openxlsx::writeComment() - constate empiriquement que apply_classic_
+# dropdowns() (qui recharge/re-sauvegarde deja le classeur avec openxlsx2 pour corriger les listes
+# deroulantes, voir plus haut) fait alors disparaitre silencieusement les commentaires ecrits par
+# openxlsx (avertissement "file expected to be in output is missing: /xl/commentsN.xml" a la
+# sauvegarde openxlsx2 - les deux bibliotheques ne serialisent pas les commentaires de la meme facon,
+# openxlsx2 ne retrouve pas la partie qu'openxlsx a ecrite et la perd au re-enregistrement). Les notes
+# sont donc, comme les listes deroulantes, mises en attente ici et ajoutees par openxlsx2 lui-meme,
+# dans la MEME session de rechargement/sauvegarde - jamais ecrites par openxlsx en premier lieu, donc
+# rien a perdre au passage par openxlsx2.
+PENDING_COMMENTS <- list()
+
+queue_comment <- function(sheet_name, col, row, text) {
+  col_letter <- openxlsx::int2col(col)
+  PENDING_COMMENTS[[length(PENDING_COMMENTS) + 1]] <<- list(
+    sheet = sheet_name, dims = paste0(col_letter, row), text = text
+  )
+  invisible(NULL)
+}
+
 # A appeler UNE FOIS, apres saveWorkbook() (openxlsx) - recharge le fichier deja sauvegarde avec
 # openxlsx2 (sans toucher a la mise en forme/protection deja ecrite par openxlsx, voir plus haut),
-# ajoute toutes les listes deroulantes enregistrees via queue_list_validation() au format classique, et
-# re-sauvegarde au meme chemin.
+# ajoute toutes les listes deroulantes enregistrees via queue_list_validation() au format classique
+# ainsi que les notes enregistrees via queue_comment(), et re-sauvegarde au meme chemin.
 apply_classic_dropdowns <- function(path) {
-  if (length(PENDING_DROPDOWN_VALIDATIONS) == 0) return(invisible(NULL))
+  if (length(PENDING_DROPDOWN_VALIDATIONS) == 0 && length(PENDING_COMMENTS) == 0) return(invisible(NULL))
   wb2 <- openxlsx2::wb_load(path)
   for (spec in PENDING_DROPDOWN_VALIDATIONS) {
     wb2 <- wb2$add_data_validation(sheet = spec$sheet, dims = spec$dims, type = "list", value = spec$value)
+  }
+  for (spec in PENDING_COMMENTS) {
+    wb2 <- wb2$add_comment(sheet = spec$sheet, dims = spec$dims,
+                           comment = openxlsx2::wb_comment(text = spec$text, author = "Pipeline JMMI", visible = FALSE))
   }
   wb2$save(path)
   invisible(NULL)
@@ -1032,11 +1120,12 @@ write_review_sheet <- function(wb, df, sheet_name = "3_A_verifier") {
   block_id <- if ("block_id" %in% colnames(df)) df$block_id else rep(NA_character_, nrow(df))
   # is_calculated_field (Verification_prix uniquement - voir expand_price_item_row() dans
   # 2_nettoyage_final.R) : certaines variables du bloc (ex. "bucket_20l_price_unit_item") sont elles-
-  # memes un champ CALCULATE de l'outil kobo, ECRASE INCONDITIONNELLEMENT par recompute_price_items()
-  # quelle que soit la valeur tapee ici - "Que faire ?"/"Nouvelle reponse" sont verrouillees pour ces
-  # lignes plus bas (apres le bandeau de bloc), pour eviter qu'une correction y semble acceptee (le
-  # journal de nettoyage l'enregistrerait) alors qu'elle n'a en realite AUCUN EFFET sur clean_data - bug
-  # constate, corrige en empechant la saisie plutot qu'en la laissant silencieusement ignoree.
+  # memes un champ CALCULATE de l'outil kobo, recalcule automatiquement par recompute_price_items() a
+  # partir des VRAIS champs saisis - la cellule "Que faire ?" reste EDITABLE comme les autres (demande
+  # utilisateur : verrouiller ces cellules rendait la revue trop penible), mais recoit une note Excel
+  # (pas un verrou) expliquant que toute correction saisie ici sera de toute facon recalculee - et que ce
+  # recalcul est desormais lui-meme journalise (voir price_recalc_log dans 2_nettoyage_final.R), donc
+  # rien n'est jamais perdu silencieusement.
   is_calculated_field <- if ("is_calculated_field" %in% colnames(df)) {
     df$is_calculated_field
   } else {
@@ -1059,13 +1148,13 @@ write_review_sheet <- function(wb, df, sheet_name = "3_A_verifier") {
   data_rows <- if (n >= 2) 2:n else integer(0)
   col_of_display <- function(key) match(REVIEW_HEADERS_FR[[key]], colnames(df_display))
   action_col <- col_of_display("action")
-  uuid_col <- col_of_display("uuid")
-  variable_col <- col_of_display("variable")
-  # colonnes techniques supplementaires (voir carry_forward_decisions()) - memes regles de grisage/
-  # verrouillage que uuid/variable ci-dessous, partout ou ces deux-la apparaissent.
-  row_id_col <- col_of_display("row_id")
+  nouvelle_reponse_col <- col_of_display("nouvelle_reponse")
   statut_col <- col_of_display("statut")
-  technical_id_cols <- c(uuid_col, row_id_col, variable_col, statut_col)
+  # colonnes A a L (toutes les colonnes d'information/contexte, de "Identifiant enquete" a "Statut") :
+  # protegees en bloc - l'equipe de suivi n'a besoin de modifier que "Que faire ?"/"Nouvelle reponse"/
+  # "Commentaire" (colonnes M a O). "statut" est la derniere colonne de REVIEW_HEADERS_FR avant "action" -
+  # 1:statut_col couvre donc exactement A:L tant que l'ordre des colonnes de REVIEW_HEADERS_FR ne change pas.
+  technical_id_cols <- 1:statut_col
 
   # en-tete : fond rouge, texte blanc, gras, figee, avec filtres
   addStyle(wb, sheet_name, style = createStyle(fgFill = RED_HEADER, fontColour = "#FFFFFF",
@@ -1142,6 +1231,22 @@ write_review_sheet <- function(wb, df, sheet_name = "3_A_verifier") {
   action_choices <- paste0('"', paste(unname(ACTION_LABELS_FR), collapse = ","), '"')
   queue_list_validation(sheet_name, col = action_col, rows = data_rows, list_range = action_choices)
 
+  # note Excel (pas un verrou, voir commentaire en tete de fonction) sur la cellule "Que faire ?" des
+  # lignes is_calculated_field - visible en survolant le petit triangle rouge ajoute par Excel dans le
+  # coin de la cellule. Mise en attente (queue_comment()) plutot qu'ecrite directement ici avec
+  # openxlsx::writeComment() - voir le commentaire au-dessus de PENDING_COMMENTS/apply_classic_dropdowns()
+  # pour la raison (openxlsx2, appele juste apres pour corriger les listes deroulantes, faisait
+  # disparaitre les commentaires ecrits par openxlsx).
+  calculated_rows <- which(is_calculated_field) + 1  # +1 pour la ligne d'en-tete
+  if (length(calculated_rows) > 0) {
+    recalcul_note <- paste0("Cette valeur est un champ calcule automatiquement a partir des autres variables ",
+                            "du bloc (prix/unite saisis ci-dessus). Vous pouvez taper une correction ici si ",
+                            "besoin, mais elle sera de toute facon recalculee automatiquement si l'une des ",
+                            "autres variables change - le recalcul final sera lui-meme visible dans le journal ",
+                            "de nettoyage.")
+    for (r in calculated_rows) queue_comment(sheet_name, col = action_col, row = r, text = recalcul_note)
+  }
+
   # liste deroulante pour "Nouvelle reponse" quand la variable signalee est une question a choix
   # (select_one/select_multiple) : chaque ligne obtient la liste des choix VALIDES DE SA PROPRE
   # question, pour eviter que l'equipe tape un libelle qui ne correspondra a aucun code une fois
@@ -1150,7 +1255,6 @@ write_review_sheet <- function(wb, df, sheet_name = "3_A_verifier") {
   # liste) - meme principe que la feuille "Listes_..." de add_other_responses_sheet(). Pour les
   # select_multiple, si plusieurs choix sont necessaires, l'equipe peut les separer par ";" (voir
   # read_review_sheet()) - la liste deroulante n'insere qu'un seul choix a la fois (limitation Excel).
-  nouvelle_reponse_col <- col_of_display("nouvelle_reponse")
   choice_lists_sheet <- substr(paste0("Listes_", sheet_name), 1, 31)
   addWorksheet(wb, choice_lists_sheet, visible = FALSE)
 
@@ -1178,18 +1282,6 @@ write_review_sheet <- function(wb, df, sheet_name = "3_A_verifier") {
     }
   }
 
-  # verrouille "Que faire ?"/"Nouvelle reponse" pour les lignes marquees is_calculated_field (voir le
-  # commentaire en tete de fonction) - APRES le bandeau de bloc ci-dessus, pour bien le remplacer sur ces
-  # cellules precises (un addStyle() ulterieur remplace entierement le style existant sur les memes
-  # cellules). Fond gris distinct du reste du bloc, meme principe visuel que les colonnes techniques
-  # "ne pas modifier" - pour que ce soit immediatement visible, pas juste techniquement bloque.
-  calculated_rows <- which(is_calculated_field) + 1  # +1 pour la ligne d'en-tete
-  if (length(calculated_rows) > 0) {
-    addStyle(wb, sheet_name, style = createStyle(fgFill = GREY_HEADER, fontColour = "#595959", wrapText = TRUE,
-                                                 valign = "top", locked = TRUE),
-             rows = calculated_rows, cols = c(action_col, nouvelle_reponse_col), gridExpand = TRUE)
-  }
-
   # colonnes elargies (notamment "Nouvelle reponse", au libelle tres long) pour que le texte de l'entete
   # tienne sur moins de lignes une fois enveloppe - permet en retour une hauteur de ligne d'en-tete plus
   # raisonnable juste en dessous (demande utilisateur : entete auparavant beaucoup trop haute). "Question"
@@ -1200,10 +1292,11 @@ write_review_sheet <- function(wb, df, sheet_name = "3_A_verifier") {
   setRowHeights(wb, sheet_name, rows = 1, heights = 26)
 
   # protection de la feuille : empeche de modifier l'en-tete (ligne 1, verrouillee par defaut) et les
-  # colonnes techniques "ne pas modifier" (uuid/variable, verrouillees ci-dessus), tout en laissant les
-  # cellules a remplir editables (deverrouillees ci-dessus) et le tri/filtre disponibles. Aucun mot de
-  # passe defini : protection uniquement contre les modifications accidentelles (un clic sur "Oter la
-  # protection" dans Excel suffit a la retirer), pas une mesure de securite.
+  # colonnes A a L (verrouillees ci-dessus), tout en laissant M a O ("Que faire ?"/"Nouvelle reponse"/
+  # "Commentaire", deverrouillees ci-dessus) editables pour toutes les lignes, et le tri/filtre
+  # disponibles. Aucun mot de passe defini : protection uniquement contre les modifications
+  # accidentelles (un clic sur "Oter la protection" dans Excel suffit a la retirer), pas une mesure de
+  # securite.
   protectWorksheet(wb, sheet_name, protect = TRUE)
 
   invisible(wb)
@@ -1311,17 +1404,31 @@ read_other_responses_sheet <- function(path, sheet_name = "5_Reponses_autres") {
 #                 colonnes de decision encore vides).
 # previous_df   : lignes du classeur precedent, DEJA retraduites en noms techniques identiques a ceux
 #                 de new_df (voir les appels dans 2_nettoyage_final.R) - peut contenir des lignes non
-#                 remplies (action encore vide), ignorees ci-dessous (rien a reprendre).
+#                 remplies (action encore vide) : ces lignes ne reprennent aucune decision (rien a
+#                 reprendre), mais passent quand meme au statut "Repris (deja traite)" (voir plus bas) -
+#                 elles ont deja ete PRESENTEES a l'equipe de suivi lors d'un cycle precedent, meme si
+#                 aucune decision n'a encore ete prise dessus, ce n'est donc pas une ligne "Nouveau".
 # id_col        : colonne identifiant stable commune aux deux data frames ("row_id").
-# action_col    : colonne "Que faire ?" - une ligne du classeur precedent n'est reprise que si elle a
-#                 une valeur non vide ici.
-# carry_cols    : autres colonnes de decision a reprendre quand une correspondance valide est trouvee
-#                 (ex. "nouvelle_reponse"/"commentaire", ou "new_value_text"/"new_value_choice").
-# old_value_col : colonne de contexte a comparer avant de reprendre une decision (garde-fou : si la
-#                 valeur d'origine a change depuis le classeur precedent - ne devrait jamais arriver si
-#                 les anciennes donnees sont vraiment figees, mais peu couteux a verifier - la decision
-#                 n'est PAS reprise, la ligne reste vierge pour une revue fraiche plutot que d'appliquer
-#                 une decision sur des donnees perimees). NULL pour desactiver cette verification.
+# action_col    : colonne "Que faire ?" - la decision n'est reprise que si elle a une valeur non vide
+#                 ici (une ligne du classeur precedent restee vide n'a rien a transmettre a ce niveau,
+#                 mais compte quand meme comme "deja vue" - voir statut_col plus bas).
+# carry_cols    : autres colonnes de decision a reprendre quand une correspondance valide ET une
+#                 decision non vide sont trouvees (ex. "nouvelle_reponse"/"commentaire", ou
+#                 "new_value_text"/"new_value_choice").
+# old_value_col : colonne de contexte a comparer avant de reprendre une decision ET avant de marquer
+#                 "Repris" (garde-fou : si la valeur d'origine a change depuis le classeur precedent -
+#                 ne devrait jamais arriver si les anciennes donnees sont vraiment figees, mais peu
+#                 couteux a verifier - la ligne reste "Nouveau" pour une revue fraiche plutot que
+#                 d'afficher a tort une ligne perimee comme deja traitee). NULL pour desactiver cette
+#                 verification.
+# statut_col    : colonne de statut ("Nouveau"/"Repris (deja traite)") - passe a "Repris (deja
+#                 traite)" pour TOUTE ligne dont le row_id existait deja dans le classeur precedent,
+#                 QU'ELLE AIT OU NON UNE DECISION REMPLIE (demande utilisateur explicite : une ligne
+#                 deja presentee au cycle precedent n'est plus "Nouveau" meme si elle n'a pas encore
+#                 ete traitee - ce qui, en pratique, marque aussi automatiquement TOUT un bloc de
+#                 "Verification_prix" comme "Repris" des qu'une seule de ses lignes liees a recu une
+#                 decision, puisque toutes les lignes d'un meme bloc existent deja ensemble dans le
+#                 classeur precedent).
 carry_forward_decisions <- function(new_df, previous_df, id_col = "row_id", action_col = "action",
                                     carry_cols = character(0), old_value_col = NULL,
                                     statut_col = "statut") {
@@ -1329,27 +1436,22 @@ carry_forward_decisions <- function(new_df, previous_df, id_col = "row_id", acti
     return(new_df)
   }
 
-  has_decision <- !is.na(previous_df[[action_col]]) & nzchar(previous_df[[action_col]])
-  previous_decided <- previous_df[has_decision, , drop = FALSE]
-  if (nrow(previous_decided) == 0) return(new_df)
-
   # un row_id ne devrait apparaitre qu'une fois dans un classeur "suivi a verifier" normal - s'il y en a
   # quand meme (ex. classeur precedent lui-meme issu d'une fusion de plusieurs fichiers), garder la
-  # PREMIERE decision rencontree pour chacun plutot que de faire planter toute la generation du
-  # classeur pour une anomalie mineure portant sur d'anciennes donnees.
-  dup_ids <- previous_decided[[id_col]][duplicated(previous_decided[[id_col]])]
+  # PREMIERE ligne rencontree pour chacun plutot que de faire planter toute la generation du classeur
+  # pour une anomalie mineure portant sur d'anciennes donnees.
+  dup_ids <- previous_df[[id_col]][duplicated(previous_df[[id_col]])]
   if (length(dup_ids) > 0) {
-    warning("Classeur precedent : ", length(unique(dup_ids)), " identifiant(s) en double avec une ",
-           "decision remplie - seule la premiere decision rencontree est reprise pour chacun : ",
-           paste(unique(dup_ids), collapse = ", "))
-    previous_decided <- previous_decided[!duplicated(previous_decided[[id_col]]), , drop = FALSE]
+    warning("Classeur precedent : ", length(unique(dup_ids)), " identifiant(s) en double - seule la ",
+           "premiere ligne rencontree est reprise pour chacun : ", paste(unique(dup_ids), collapse = ", "))
+    previous_df <- previous_df[!duplicated(previous_df[[id_col]]), , drop = FALSE]
   }
 
-  match_idx <- match(new_df[[id_col]], previous_decided[[id_col]])
-  can_carry <- !is.na(match_idx)
+  match_idx <- match(new_df[[id_col]], previous_df[[id_col]])
+  matched <- !is.na(match_idx)
 
   if (!is.null(old_value_col) && old_value_col %in% colnames(new_df) &&
-      old_value_col %in% colnames(previous_decided)) {
+      old_value_col %in% colnames(previous_df)) {
     # NA et "" traites comme EQUIVALENTS ("valeur absente") avant comparaison - sans cela, un champ
     # legitimement vide des les deux executions (ex. "_other_unit_item" quand l'unite standard a ete
     # utilisee, jamais rempli) casse silencieusement la reprise : construit fraichement, il vaut ""
@@ -1359,23 +1461,36 @@ carry_forward_decisions <- function(new_df, previous_df, id_col = "row_id", acti
     # cellule vide en NA) - "" != NA (resultat NA en R, converti en FALSE juste apres) bloquait donc a
     # tort la reprise, precisement pour les champs les plus souvent vides.
     norm_empty <- function(x) ifelse(is.na(x) | !nzchar(x), "", x)
-    old_matches <- norm_empty(new_df[[old_value_col]]) == norm_empty(previous_decided[[old_value_col]][match_idx])
+    old_matches <- norm_empty(new_df[[old_value_col]]) == norm_empty(previous_df[[old_value_col]][match_idx])
     old_matches[is.na(old_matches)] <- FALSE
-    can_carry <- can_carry & old_matches
+    matched <- matched & old_matches
   }
 
-  if (!any(can_carry)) return(new_df)
+  if (!any(matched)) return(new_df)
 
-  src_idx <- match_idx[can_carry]
-  new_df[[action_col]][can_carry] <- previous_decided[[action_col]][src_idx]
-  for (col in carry_cols) {
-    if (col %in% colnames(previous_decided)) {
-      new_df[[col]][can_carry] <- previous_decided[[col]][src_idx]
+  # statut : TOUTE ligne matchee passe a "Repris (deja traite)", decision presente ou non (voir
+  # commentaire en tete de fonction).
+  if (statut_col %in% colnames(new_df)) {
+    new_df[[statut_col]][matched] <- "Repris (deja traite)"
+  }
+
+  # decision (action + carry_cols) : reprise uniquement pour le sous-ensemble des lignes matchees qui
+  # ont effectivement une valeur non vide dans action_col du classeur precedent - une ligne matchee mais
+  # restee vide n'a rien a transmettre a ce niveau (elle a deja obtenu son statut "Repris" ci-dessus).
+  src_idx <- match_idx[matched]
+  has_decision <- !is.na(previous_df[[action_col]][src_idx]) & nzchar(previous_df[[action_col]][src_idx])
+  if (any(has_decision)) {
+    can_carry <- matched
+    can_carry[matched] <- has_decision
+    src_idx_decided <- src_idx[has_decision]
+    new_df[[action_col]][can_carry] <- previous_df[[action_col]][src_idx_decided]
+    for (col in carry_cols) {
+      if (col %in% colnames(previous_df)) {
+        new_df[[col]][can_carry] <- previous_df[[col]][src_idx_decided]
+      }
     }
   }
-  if (statut_col %in% colnames(new_df)) {
-    new_df[[statut_col]][can_carry] <- "Repris (deja traite)"
-  }
+
   new_df
 }
 
@@ -2110,6 +2225,15 @@ build_final_workbook <- function(raw_data_export, clean_data_export, cleaning_lo
     addStyle(wb, "deletion_log", style = createStyle(wrapText = TRUE, valign = "top"),
             rows = 2:(nrow(deletion_log_final) + 1), cols = reason_col, gridExpand = TRUE, stack = TRUE)
   }
+
+  # loadWorkbook() conserve l'onglet actif du modele checklist_template.xlsx tel qu'il etait ouvert
+  # dans Excel au moment ou ce fichier a ete enregistre (ex. "cleaning_log", 8eme onglet du modele
+  # complet a 10 feuilles) - un index qui n'existe plus une fois les feuilles placeholder retirees
+  # ci-dessus (7 feuilles restantes a ce stade). Sans cette reinitialisation explicite,
+  # worksheetOrder<-() plus bas echoue ("N doesn't exist as sheet index") des que le modele a ete
+  # resauvegarde avec un autre onglet que le premier actif - reinitialiser sur la 1ere feuille avant
+  # tout reordonnancement rend ce comportement independant de l'etat du fichier modele.
+  activeSheet(wb) <- 1
 
   desired_order <- intersect(c("CHECKLIST_Data_Cleaning","READ_ME","survey","choices","variable_tracker",
                                "raw_data","clean_data","cleaning_log","deletion_log"), names(wb))
