@@ -1,4 +1,4 @@
-# JMMI RCA – Dashboard (`rca_jmmi_dashboard`)
+# RCA JMMI Dashboard
 
 Shiny dashboard that runs the full monthly **JMMI / ICSM (Initiative Conjointe de Suivi des Marchés)** data pipeline for REACH Central African Republic. The pipeline covers daily monitoring during collection, data cleaning, and the monthly analysis (PMAS/MEB, Market Functionality Score). Users do not need R. They upload Excel files in the browser, click **Lancer**, and download the resulting workbook.
 
@@ -99,7 +99,7 @@ rca_jmmi_dashboard/
 └── sample_output/               # Example outputs (August 2026 round)
 ```
 
-**This folder is self-contained.** The `.R` scripts and `ressources/` are copies of the standalone projects in this repository: `rca_jmmi_cleaning` for cleaning, `rca_jmmi_analysis` for analysis, and `rca_jmmi_relabelling` for relabelling. The copies exist so the dashboard can be deployed on its own. There is **no automatic sync**: if the source projects change, copy the files here again.
+**This folder is self-contained.** The `.R` scripts and `ressources/` are copies of the standalone projects in the [`REACH_CAR_JMMI_scripts`](https://github.com/gio-giuliari/REACH_CAR_JMMI_scripts) repository, where this dashboard also lives as `rca_jmmi_dashboard/`. The sources are `rca_jmmi_cleaning` for cleaning, `rca_jmmi_analysis` for analysis, and `rca_jmmi_relabelling` for relabelling. The copies exist so the dashboard can be deployed on its own. There is **no automatic sync**: if the source projects change, copy the files here again.
 
 ---
 
