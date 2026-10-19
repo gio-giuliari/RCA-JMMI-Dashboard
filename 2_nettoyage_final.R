@@ -132,82 +132,6 @@ if (nrow(ras_log) > 0) {
   cat("--> ", nrow(ras_log), " reponse(s) sans information utile converties automatiquement en vide.\n", sep = "")
 }
 
-################################################################################
-# CORRECTION AUTOMATIQUE DES REPONSES "AUTRE" SANS CONTRAINTE "RELEVANT" RESPECTEE
-################################################################################
-# Un champ "autre" (texte libre) REMPLI alors que le choix "autre"/"other" n'a PAS ete selectionne pour
-# sa question de reference (other_db - name=champ texte, ref_question=question a choix associee,
-# option_other=le choix cense rendre ce champ visible/remplissable dans kobo, via son "relevant") est la
-# consequence d'un bug de l'outil kobo (logique "relevant" non appliquee au moment de la collecte), pas
-# une vraie reponse "autre" a reclasser - videe automatiquement ICI, AVANT la detection des reponses
-# "autre" plus bas (donc jamais signalee comme "autre" a recoder), sans passer par une revue manuelle
-# dans A_verifier (demande explicite de l'utilisateur). Verifiee GENERIQUEMENT pour tous les champs
-# "autre" de l'outil (other_db) - observee sur mfs_ac1_physical_access_mkt_issues_other/
-# mfs_ac4_physical_access_security_issues_other.
-missing_constraint_log <- tibble(uuid = character(0), question = character(0), old_value = character(0),
-                                 change_type = character(0), new_value = character(0), issue = character(0),
-                                 comment = character(0))
-for (r in seq_len(nrow(other_db))) {
-  autre_var <- other_db$name[r]
-  ref_var <- other_db$ref_question[r]
-  option <- other_db$option_other[r]
-  q_type <- other_db$q_type[r]
-
-  # repli : quand l'outil kobo ne definit AUCUNE contrainte "relevant" pour ce champ "autre" (constate
-  # sur mfs_ac1_physical_access_mkt_issues_other dans l'outil 2026-08 - contrairement a
-  # mfs_ac4_physical_access_security_issues_other, dont le relevant EST bien defini et deja
-  # correctement extrait par get_other_db()), ref_question retombe sur le nom du champ "autre" lui-meme
-  # (repli deja present dans get_other_labels()) - PRECISEMENT le cas ou cette verification est le plus
-  # utile, puisque l'absence de contrainte est elle-meme le bug a detecter. On retrouve alors la vraie
-  # question de reference par une convention de nommage kobo courante (meme prefixe, suffixe "_other"
-  # remplace par "_sm" ou "_so" - observee sur mfs_ac1/mfs_ac4 dans cet outil), et son choix
-  # "autre"/"other" dans la liste de choix correspondante.
-  if (is.na(ref_var) || identical(ref_var, autre_var)) {
-    candidate <- str_replace(autre_var, "_other$", "_sm")
-    if (!candidate %in% kobo_survey$name) candidate <- str_replace(autre_var, "_other$", "_so")
-    if (candidate %in% kobo_survey$name && candidate != autre_var) {
-      cand_row <- kobo_survey[kobo_survey$name == candidate, ][1, ]
-      ref_var <- candidate
-      q_type <- cand_row$q_type
-      autre_choice <- kobo_choices$name[kobo_choices$list_name == cand_row$list_name &
-                                        kobo_choices$name %in% c("autre", "other")]
-      option <- if (length(autre_choice) > 0) autre_choice[1] else NA_character_
-    }
-  }
-
-  if (is.na(autre_var) || is.na(ref_var) || is.na(option)) next
-  if (!autre_var %in% colnames(raw_data_all)) next
-
-  autre_vals <- raw_data_all[[autre_var]]
-  has_autre_text <- !is.na(autre_vals) & nzchar(trimws(autre_vals))
-  if (!any(has_autre_text)) next
-
-  if (identical(q_type, "select_multiple")) {
-    option_col <- paste0(ref_var, "/", option)
-    if (!option_col %in% colnames(raw_data_all)) next
-    option_selected <- !is.na(raw_data_all[[option_col]]) & raw_data_all[[option_col]] == "1"
-  } else {
-    if (!ref_var %in% colnames(raw_data_all)) next
-    option_selected <- !is.na(raw_data_all[[ref_var]]) & raw_data_all[[ref_var]] == option
-  }
-
-  is_violation <- has_autre_text & !option_selected
-  if (any(is_violation)) {
-    missing_constraint_log <- bind_rows(missing_constraint_log, tibble(
-      uuid = raw_data_all$uuid[is_violation], question = autre_var, old_value = autre_vals[is_violation],
-      change_type = "blank_response", new_value = NA_character_,
-      issue = paste0("Reponse \"autre\" videe automatiquement : le choix \"", option,
-                     "\" n'a pas ete selectionne pour la question '", ref_var,
-                     "' (contrainte \"relevant\" manquante dans l'outil kobo)"),
-      comment = "Videe automatiquement avant verification"
-    ))
-    raw_data_all[[autre_var]][is_violation] <- NA_character_
-  }
-}
-if (nrow(missing_constraint_log) > 0) {
-  cat("--> ", nrow(missing_constraint_log), " reponse(s) \"autre\" videe(s) automatiquement (contrainte \"relevant\" manquante).\n", sep = "")
-}
-
 period <- get_assessment_period(raw_data_all, date_col = "date")
 has_logical_checks <- nrow(logical_checks_list) > 0
 
@@ -541,9 +465,7 @@ df_pct_missing <- pm$percentage_missing_log %>%
   select(uuid, question, old_value, issue, check_id, check_binding, change_type, new_value) %>%
   left_join(raw_data_all %>% select(uuid, all_of(INFO_COLS)), by = "uuid")
 
-# toutes les verifications combinees dans un seul tableau (la contrainte "relevant" manquante
-# mfs_ac1/mfs_ac4 - voir missing_constraint_log plus haut - n'apparait PAS ici : elle est corrigee
-# automatiquement avant meme ce point, pas laissee a la revue de l'equipe de suivi).
+# toutes les verifications combinees dans un seul tableau
 all_issues <- bind_rows(df_principal, df_outliers, df_soft_dup, df_pct_missing)
 
 # anonymisation du nom de la boutique/du vendeur (DPI, voir remove_cols plus bas ou shop_name est
@@ -1247,7 +1169,6 @@ combined_cleaning_log <- filled_no_deletion %>%
   rbind(cleaning_log_other) %>%
   rbind(ras_log %>% select(uuid, question, change_type, old_value, new_value, issue, comment)) %>%
   rbind(days_zero_log %>% select(uuid, question, change_type, old_value, new_value, issue, comment)) %>%
-  rbind(missing_constraint_log %>% select(uuid, question, change_type, old_value, new_value, issue, comment)) %>%
   rbind(price_recalc_log %>% select(uuid, question, change_type, old_value, new_value, issue, comment))
 
 # raw_data_all_avant_ras (avant la conversion automatique RAS -> vide, voir plus haut) est utilise ici,

@@ -84,6 +84,7 @@ kobo_survey <- read_excel(KOBO_TOOL_FILE, sheet = "survey", col_types = "text") 
 
 kobo_choices <- read_excel(KOBO_TOOL_FILE, sheet = "choices", col_types = "text") %>%
   rename_with(tolower) %>%
+  standardise_choices_label() %>%  # "label" ou "label::french" (voir scripts/fonctions_analyse.R)
   filter(!is.na(list_name)) %>%
   select(list_name, name, label) %>%
   distinct()

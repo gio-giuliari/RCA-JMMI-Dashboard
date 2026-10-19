@@ -34,6 +34,22 @@ get_assessment_period_from_data <- function(df, date_col = "date") {
 }
 
 ##############################################################################################################
+# LECTURE DE L'OUTIL KOBO
+##############################################################################################################
+# feuille "choices" : colonne de libelle "label" ou "label::french" ("label::french" retenue si les deux
+# existent) - meme logique que standardise_choices_label() dans scripts/fonctions_nettoyage.R, dupliquee
+# ici (plutot que sourcee depuis l'autre pipeline) pour que ce script d'analyse reste autonome.
+standardise_choices_label <- function(choices) {
+  if ("label::french" %in% names(choices)) {
+    choices <- choices %>% select(-any_of("label")) %>% rename(label = `label::french`)
+  }
+  if (!"label" %in% names(choices)) {
+    stop("Feuille \"choices\" de l'outil kobo : aucune colonne \"label\" ni \"label::french\" trouvee.")
+  }
+  choices
+}
+
+##############################################################################################################
 # ETIQUETAGE (name -> label, code -> label) - "Donnees nettoyees"
 ##############################################################################################################
 
@@ -128,7 +144,7 @@ build_loa <- function(kobo_survey, group_var = "admin2_label", level = 0.95, exc
   eligible <- kobo_survey %>%
     filter(q_type %in% c("select_one", "select_multiple")) %>%
     filter(!name %in% exclude_vars) %>%
-    filter(!str_ends(name, "_other")) %>%  # champs texte libre "si autre, precisez" (type="text" de toute facon, garde-fou)
+    filter(!str_detect(name, "_other(_tx)?$")) %>%  # champs texte libre "si autre, precisez" (type="text" de toute facon, garde-fou)
     distinct(name, .keep_all = TRUE)
 
   all_vars <- bind_rows(

@@ -50,9 +50,10 @@ kobo_survey <- read_excel(Sys.getenv("kobo"), sheet="survey", col_types="text") 
   mutate(q_type=as.character(lapply(type, function(x) str_split(x, " ")[[1]][1])),
          list_name=as.character(lapply(type, function(x) str_split(x, " ")[[1]][2])))
 
-# la feuille choices de la RCA a deja une colonne "label" simple (pas de suffixe "::french" comme la feuille survey)
+# colonne de libelle de la feuille choices : "label" ou "label::french" (voir standardise_choices_label())
 kobo_choices <- read_excel(Sys.getenv("kobo"), sheet="choices", col_types="text") %>%
   rename_with(.,tolower) %>%
+  standardise_choices_label() %>%
   filter(!is.na(list_name)) %>%
   select(list_name, name, label) %>%
   distinct()

@@ -26,6 +26,24 @@
 ################################################################################
 
 #############################################################################################################
+# LECTURE DE L'OUTIL KOBO
+#############################################################################################################
+
+# feuille "choices" : la colonne de libelle s'appelle "label" (outils jusqu'a 2026-08) ou "label::french"
+# (outil 2026-10, meme convention que la feuille survey) - "label::french" est retenue si les deux
+# existent. Renvoie `choices` avec une seule colonne "label", le nom attendu partout ailleurs
+# (kobo_choices$label). Noms de colonnes deja passes en minuscules par l'appelant (rename_with(tolower)).
+standardise_choices_label <- function(choices) {
+  if ("label::french" %in% names(choices)) {
+    choices <- choices %>% select(-any_of("label")) %>% rename(label = `label::french`)
+  }
+  if (!"label" %in% names(choices)) {
+    stop("Feuille \"choices\" de l'outil kobo : aucune colonne \"label\" ni \"label::french\" trouvee.")
+  }
+  choices
+}
+
+#############################################################################################################
 # LECTURE DU JEU DE DONNEES
 #############################################################################################################
 
